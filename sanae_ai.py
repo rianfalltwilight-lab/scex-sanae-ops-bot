@@ -221,10 +221,10 @@ def _fn(name, desc, props, required):
             "parameters": {"type": "object", "properties": props, "required": required}}}
 
 RUN_RCON_FULL = _fn("run_rcon", "在 Minecraft 服务器上执行一条受限 RCON 命令并返回结果。命令不带前导斜杠。"
-    "允许查询 list、neoforge tps、seed、time query、difficulty、gamerule；"
+    "允许查询 list、neoforge tps、seed、time query day/daytime/gametime、difficulty、gamerule；"
     "管理员当前消息明确要求时，允许低风险 weather、time、say。give/fill/execute/data/玩家管理/停服重启等必须改用带确认码的 !cmd 或 !restart。",
     {"command": {"type": "string"}}, ["command"])
-RUN_RCON_RO = _fn("run_rcon", "执行只读查询命令：list、neoforge tps / forge tps、time query daytime/gametime、"
+RUN_RCON_RO = _fn("run_rcon", "执行只读查询命令：list、neoforge tps / forge tps、time query day/daytime/gametime、"
     "difficulty、gamerule 规则名、seed。只能查询，改动类命令会被拒绝。",
     {"command": {"type": "string"}}, ["command"])
 VERIFY_RCON_COMMAND = _fn(
@@ -725,6 +725,28 @@ def _generic_hypothetical(text):
     asks_current = bool(re.search(r'(本服|服务器).{0,10}(当前|现在|实际|配置|状态)|查一下|查查|实际是多少', text, re.I))
     asks_explanation = bool(re.search(r'(是什么意思|会怎样|有什么效果|什么作用|原理|解释|说明)', text, re.I))
     return asks_explanation and not asks_current
+
+
+def _has_server_query_intent(text):
+    """Identify a live, read-only server question without mapping prose to a command.
+
+    The model still chooses the exact allow-listed RCON query.  This gate only
+    decides that a live answer must come from a tool instead of model memory.
+    """
+    value = re.sub(r'\[CQ:[^\]]*\]', '', str(text or '')).strip()
+    if not value or _no_tool_explanation(value):
+        return False
+    subject = re.search(
+        r'(?i)(?:\btps\b|性能|卡不卡|在线(?:玩家)?|玩家列表|人数|几个人|多少人|'
+        r'天数|多少天|第几天|世界.{0,4}天|游戏.{0,4}天|游戏时间|世界时间|'
+        r'难度|种子|\bgamerule\b|游戏规则|服务器状态)', value)
+    if not subject:
+        return False
+    explanation = re.search(r'(?i)(是什么|什么意思|原理|什么作用|怎么计算|怎么算|举例|示例)', value)
+    live_marker = re.search(
+        r'(?i)(现在|当前|目前|实时|本服|服务器|怀旧服|服里|游戏里|查一下|查查|看看|多少|几个|咋样|怎么样)',
+        value)
+    return bool(live_marker or not explanation)
 
 
 def _tool_read_chat(args):
@@ -1557,11 +1579,20 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
     history = _get_history(group_id, user_id, privileged)
     explanation_only = _no_tool_explanation(user_text) or _generic_hypothetical(user_text)
     system_prompt = SANAE_SYSTEM + '\n\n' + SANAE_OPERATIONAL_POLICY
+    read_only_tool_required = bool(
+        selected_server and not explanation_only and not social_only and
+        _has_server_query_intent(user_text))
     operation_tool_required = bool(
-        privileged and selected_server and explicit_server and
+        not read_only_tool_required and privileged and selected_server and explicit_server and
         (_has_console_command_intent(user_text) or
          _has_confirmation_intent(user_text) or
          _has_cancellation_intent(user_text)))
+    if read_only_tool_required:
+        system_prompt += ("\n\n## 【本轮实时服务器查询强制约束】\n"
+                          "当前消息询问本服实时状态，首轮必须调用 run_rcon，禁止凭模型记忆猜答案。"
+                          "询问世界已经运行多少天/第几天时使用 `time query day`；"
+                          "询问一天内时刻使用 `time query daytime`；询问总游戏刻使用 `time query gametime`。"
+                          "拿到工具结果后再用一句简短中文解释，不要把 Minecraft 世界天数说成现实日期。")
     if operation_tool_required:
         system_prompt += ("\n\n## 【本轮管理员操作强制约束】\n"
                           "当前消息是在唯一明确的服务器上执行、确认或取消操作。必须调用工具，禁止纯文本回复，"
@@ -1584,7 +1615,12 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
     messages = [{'role': 'system', 'content': system_prompt}]
     messages.extend(history)
     messages.append({'role': 'user', 'content': user_text[:2000]})
-    tools = [] if (explanation_only or social_only) else (TOOLS_ADMIN if privileged else TOOLS_MEMBER)
+    if explanation_only or social_only:
+        tools = []
+    elif read_only_tool_required:
+        tools = [RUN_RCON_FULL if privileged else RUN_RCON_RO]
+    else:
+        tools = TOOLS_ADMIN if privileged else TOOLS_MEMBER
     usage = _Usage()
     answer = None
     used_tools = False
@@ -1594,6 +1630,7 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
     allow_config_write = bool(privileged and _has_config_write_intent(user_text))
     allow_group_file_download = bool(privileged and _has_group_file_download_intent(user_text))
     terminal_result = None
+    read_only_tool_completed = False
     try:
         for step in range(8):
             payload = {'model': DS_MODEL, 'messages': messages, 'stream': False,
@@ -1601,13 +1638,18 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
                        'thinking': {'type': 'enabled'},
                        'reasoning_effort': DEEPSEEK_REASONING_EFFORT}
             if tools:
+                # DeepSeek requires the tool schema to remain present on later
+                # turns whenever message history contains assistant tool_calls.
+                # Only tool_choice is relaxed after the first read-only result.
                 payload['tools'] = tools
-            if operation_tool_required:
+            if operation_tool_required or read_only_tool_required:
                 # DeepSeek V4 rejects tool_choice in thinking mode. Natural
-                # operations are short routing tasks, so use the documented
-                # non-thinking mode and force a validated tool call.
+                # operations are short routing tasks, so keep the whole tool
+                # exchange in non-thinking mode.  Switching thinking back on
+                # after a tool result is rejected by the provider.
                 payload['thinking'] = {'type': 'disabled'}
                 payload.pop('reasoning_effort', None)
+            if operation_tool_required or (read_only_tool_required and not read_only_tool_completed):
                 payload['tool_choice'] = 'required'
             d = _post(DS_URL, DS_KEY, payload)
             usage.add(d, priced=True, quote=DEEPSEEK_TEXT_PRICING,
@@ -1641,6 +1683,8 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
                                       selected_server=selected_server,
                                       user_id=user_id, nickname=nickname,
                                       explicit_server=explicit_server)
+                if read_only_tool_required and name == 'run_rcon':
+                    read_only_tool_completed = True
                 print(f'[sanae] 工具调用: {name} args={json.dumps(args, ensure_ascii=False)[:120]} -> {str(result)[:120]}', flush=True)
                 if name == 'verify_rcon_command' and str(result).startswith('命令树核验通过：'):
                     candidate = str(args.get('command', '')).strip().lstrip('/').strip()

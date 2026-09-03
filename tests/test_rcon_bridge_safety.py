@@ -213,6 +213,17 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertIn('AnotherPlayer', cleaned)
         self.assertTrue(unambiguous)
 
+    def test_natural_server_questions_bypass_social_only_routing(self):
+        self.assertTrue(b._natural_server_operation_candidate(
+            '[CQ:at,qq=1] 现在多少天了', False, at_call=True))
+        self.assertTrue(b._natural_server_operation_candidate(
+            '怀旧服现在在线几个人', False))
+        self.assertTrue(b._natural_server_operation_candidate(
+            '给 ExamplePlayer OP', True))
+        self.assertFalse(b._natural_server_operation_candidate('给你看个图片', True))
+        self.assertFalse(b._natural_server_operation_candidate('今天几号', False))
+        self.assertFalse(b._natural_server_operation_candidate('给 ExamplePlayer OP', False))
+
     def test_rcon_dispatch_uses_per_server_backend(self):
         calls = []
 

@@ -349,6 +349,25 @@ def _pending_natural_operation_reply(raw, user_id, privileged):
         return False
     return bool(_rcon_ops.pending_confirmation(str(user_id)))
 
+
+def _natural_server_operation_candidate(raw, privileged, direct_call=False, at_call=False):
+    """Route explicit live queries and admin imperatives away from social-only mode."""
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw or ''), flags=re.I).strip()
+    explicit, _cleaned = extract_natural_server_selector(raw)
+    mentions_server = bool(explicit or re.search(
+        r'(?i)(?:本服|服务器|怀旧服|服里|游戏里|Minecraft|\bMC\b|\bTPS\b)', text))
+    if _sanae_ai._has_server_query_intent(raw):
+        return bool(direct_call or at_call or mentions_server)
+    # Admin mutations remain confirmation-gated in sanae_ai.  Avoid treating a
+    # casual sentence containing a broad verb such as “给” as an operation:
+    # without a direct call/server mention, require a command-shaped subject.
+    command_subject = re.search(
+        r'(?i)(?:\bop\b|管理(?:员|权限)|权限|封禁|解封|白名单|踢出|传送|召唤|'
+        r'重载|重启|停服|备份|\bgive\b|\bfill\b|\bkill\b|\btp\b|\bban\b|'
+        r'\bpardon\b|\bwhitelist\b|(?:^|\s)/[A-Za-z])', text)
+    return bool(privileged and _sanae_ai._has_console_command_intent(raw) and
+                (direct_call or at_call or mentions_server or command_subject))
+
 # ===== MC 百科查询（!wiki/!百科 → mcmod.cn）=====
 _WIKI_PATTERNS = [
     re.compile(r'^!?\s*wiki\s+(.+)$', re.I),
@@ -745,10 +764,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 at_candidate = self._is_at_bot(event)
                 pending_operation_candidate = _pending_natural_operation_reply(
                     raw, uid, privileged)
+                natural_operation_candidate = _natural_server_operation_candidate(
+                    raw, privileged, direct_name_candidate, at_candidate)
                 fun_mute_reason = _fun_mute_reason(event)
                 if (_is_duplicate(raw, uid) and
                         not (direct_name_candidate or at_candidate or
-                             pending_operation_candidate or fun_mute_reason)):
+                             pending_operation_candidate or natural_operation_candidate or
+                             fun_mute_reason)):
                     self._respond(200, '{"status":"ok"}')
                     return
 
@@ -962,6 +984,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     threading.Thread(target=self._sanae_reply_thread,
                                      args=(event, True), daemon=True).start()
                     print(f"[sanae] 待确认操作自然回复: user={uid}", flush=True)
+                    self._respond(200, '{"status":"ok"}')
+                    return
+                if natural_operation_candidate:
+                    threading.Thread(target=self._sanae_reply_thread,
+                                     args=(event, True), daemon=True).start()
+                    print(f"[sanae] 自然服务器操作: user={uid}", flush=True)
                     self._respond(200, '{"status":"ok"}')
                     return
                 if at_candidate:

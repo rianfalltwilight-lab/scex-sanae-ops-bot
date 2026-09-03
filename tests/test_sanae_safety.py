@@ -126,6 +126,42 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertFalse(s._has_console_command_intent('看看怀旧服蓝图有哪些指令'))
         self.assertFalse(s._has_confirmation_intent('不要执行，取消'))
 
+    def test_live_server_query_intent_requires_fresh_tool_evidence(self):
+        self.assertTrue(s._has_server_query_intent('现在怀旧服多少天了'))
+        self.assertTrue(s._has_server_query_intent('早苗，服里在线几个人'))
+        self.assertTrue(s._has_server_query_intent('当前 TPS 怎么样'))
+        self.assertFalse(s._has_server_query_intent('TPS 是什么意思'))
+        self.assertFalse(s._has_server_query_intent('今天几号'))
+
+    def test_world_day_query_forces_one_rcon_call_then_summarizes(self):
+        replies = iter([
+            {'choices': [{'message': {'content': '', 'tool_calls': [{
+                'id': 'day', 'type': 'function', 'function': {
+                    'name': 'run_rcon', 'arguments': '{"command":"time query day"}'}}]}}],
+             'usage': {}},
+            {'choices': [{'message': {'content': '怀旧服现在是第 269 天。'}}], 'usage': {}},
+        ])
+        server = {'id': 'legacy', 'name': 'Legacy', 'prefix': '[怀旧]'}
+        payloads = []
+
+        def fake_post(_url, _key, payload, *_args, **_kwargs):
+            payloads.append(payload)
+            return next(replies)
+
+        with mock.patch.object(s, '_post', side_effect=fake_post), \
+             mock.patch.object(s, 'execute_tool', return_value='The time is 269') as execute:
+            answer, _, used_tools = s.run_agent(
+                '现在怀旧服多少天了', '1', False, 1,
+                selected_server=server, explicit_server=True)
+        self.assertTrue(used_tools)
+        self.assertEqual('怀旧服现在是第 269 天。', answer)
+        self.assertEqual('run_rcon', execute.call_args.args[0])
+        self.assertEqual('required', payloads[0]['tool_choice'])
+        self.assertEqual('run_rcon', payloads[0]['tools'][0]['function']['name'])
+        self.assertEqual('run_rcon', payloads[1]['tools'][0]['function']['name'])
+        self.assertNotIn('tool_choice', payloads[1])
+        self.assertEqual({'type': 'disabled'}, payloads[1]['thinking'])
+
     def test_natural_console_request_keeps_confirmation_boundary(self):
         server = {'id': 'legacy', 'name': 'Legacy', 'prefix': '[怀旧]'}
         with mock.patch.object(s._command_catalog, 'validate',
