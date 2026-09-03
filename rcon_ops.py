@@ -400,7 +400,12 @@ def cmd_rules():
 
 
 def cmd_version():
-    """版本信息：RCON version 命令拿不到（MC 无此命令），用工具包同款本地目录检测 + 已知信息兜底。"""
+    """Return version metadata for the active server; never use another server's fallback."""
+    server = active_server()
+    if server:
+        label = str(server.get("version_label") or "").strip()
+        if label:
+            return "[版本] " + label[:200]
     try:
         # 先试 RCON（部分服务端/代理支持 version）
         out = _run("version")
@@ -408,7 +413,11 @@ def cmd_version():
             return "[版本] " + out.strip()[:200]
     except Exception:
         pass
-    return os.environ.get("MC_VERSION_LABEL", "[版本] 请配置 MC_VERSION_LABEL")
+    configured = str(os.environ.get("MC_VERSION_LABEL") or "").strip()
+    if configured:
+        return configured if configured.startswith("[版本]") else "[版本] " + configured[:200]
+    name = str((server or {}).get("name") or "当前服务器").strip()
+    return f"[版本] {name}（详细版本未在服务器注册表登记）"
 
 
 def cmd_uptime():

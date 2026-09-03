@@ -187,6 +187,42 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertTrue(explicit)
         self.assertEqual('', error)
 
+    def test_single_server_cmd_confirmation_needs_no_redundant_prefix(self):
+        legacy = {'id': 'legacy', 'name': 'Legacy', 'prefix': '[怀旧]',
+                  'version_label': 'SCEX Legacy Genesis（Minecraft 1.21.1 + NeoForge 21.1.248）'}
+        with mock.patch.object(b, 'get_selected', return_value=(None, '未设置')), \
+             mock.patch.object(b, 'list_servers', return_value=[legacy]):
+            target, command, explicit, error = b._command_target('！cmd say test', 'g', 'u')
+            self.assertEqual('legacy', target['id'])
+            self.assertEqual('!cmd say test', command)
+            self.assertFalse(explicit)
+            self.assertEqual('', error)
+            self.assertTrue(b._high_risk_target_allowed(command.lstrip('!'), target, explicit))
+            self.assertTrue(b._high_risk_target_allowed('确认 ABCD', target, explicit))
+            self.assertFalse(b._high_risk_target_allowed('restart', target, explicit))
+            self.assertFalse(b._high_risk_target_allowed('stop', target, explicit))
+        self.assertTrue(r.is_known_command(command.lstrip('!')))
+        with mock.patch.object(r, '_request_risk', return_value='PENDING') as request:
+            result = r.dispatch('cmd say test', 'n', 'owner', True,
+                                query_fn=lambda _command: self.fail('must not execute before confirmation'),
+                                server=legacy)
+        self.assertEqual('PENDING', result)
+        request.assert_called_once()
+
+    def test_multiple_servers_still_require_explicit_cmd_target(self):
+        first = {'id': 'one', 'prefix': '[one]'}
+        second = {'id': 'two', 'prefix': '[two]'}
+        with mock.patch.object(b, 'list_servers', return_value=[first, second]):
+            self.assertFalse(b._high_risk_target_allowed('cmd say test', first, False))
+            self.assertTrue(b._high_risk_target_allowed('cmd say test', first, True))
+
+    def test_version_comes_from_active_server_registry(self):
+        legacy = {'id': 'legacy', 'name': 'Legacy', 'prefix': '[怀旧]',
+                  'version_label': 'SCEX Legacy Genesis（Minecraft 1.21.1 + NeoForge 21.1.248）'}
+        result = r.dispatch('version', 'n', 'u', False,
+                            query_fn=lambda _command: 'Unknown command', server=legacy)
+        self.assertEqual('[版本] ' + legacy['version_label'], result)
+
     def test_html_escaped_server_selector_routes_cmd(self):
         raw = ' &#91;怀旧&#93; !cmd sophisticatedbackpacks list ExamplePlayer'
         target, command, explicit, error = b._command_target(raw, 'g', 'u')

@@ -3,6 +3,7 @@
     {
       "id": "legacy",
       "name": "SCEX Legacy Genesis",
+      "version_label": "SCEX Legacy Genesis（Minecraft 1.21.1 + NeoForge 21.1.248）",
       "prefix": "[怀旧]",
       "aliases": ["怀旧", "legacy"],
       "enabled": true,
@@ -16,4 +17,3 @@
     }
   ]
 }
-

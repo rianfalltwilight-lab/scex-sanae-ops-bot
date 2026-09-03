@@ -296,7 +296,26 @@ def _command_target(raw, group_id, user_id):
     if explicit:
         return explicit, cleaned, True, ''
     selected, error = get_selected(group_id, user_id)
-    return selected, cleaned, False, error or ''
+    if selected:
+        return selected, cleaned, False, error or ''
+    enabled = list_servers()
+    if len(enabled) == 1:
+        return enabled[0], cleaned, False, ''
+    return None, cleaned, False, error or ''
+
+
+def _high_risk_target_allowed(command, target, explicit):
+    """Allow prefix omission only for the confirmation state machine on one server.
+
+    ``cmd`` still calls ``_request_risk`` and never executes here.  Restart and
+    stop deliberately remain excluded and continue to require an explicit target.
+    """
+    if explicit:
+        return bool(target)
+    if not target or len(list_servers()) != 1:
+        return False
+    return _rcon_ops.command_word(command) in {
+        'cmd', '控制台', '确认', 'confirm', '取消确认', 'cancel'}
 
 
 def _ai_operation_target(raw, group_id, user_id):
@@ -915,7 +934,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     cmd_text = cleaned_command.lstrip()[1:].strip()
                     if _rcon_ops.is_known_command(cmd_text):
                         targetless = _rcon_ops.is_targetless_command(cmd_text)
-                        if _rcon_ops.is_high_risk_command(cmd_text) and not explicit:
+                        if (_rcon_ops.is_high_risk_command(cmd_text) and
+                                not _high_risk_target_allowed(cmd_text, target, explicit)):
                             reply = (f'{server_hint()} 高风险操作必须在本条命令明确目标。'
                                      f'例如：{server_hint()} !restart 或 {server_hint()} !cmd <命令>。')
                         elif not target and not targetless:
@@ -930,7 +950,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                 reply = '拒绝：该命令需要群主或管理员权限。'
                             if target:
                                 reply = f'{server_prefix(target)} {reply}'
-                                if '[高危确认]' in reply:
+                                if '[高危确认]' in reply and len(list_servers()) > 1:
                                     reply = reply.replace(
                                         '发送：!确认',
                                         f'发送：{server_prefix(target)} !确认')
