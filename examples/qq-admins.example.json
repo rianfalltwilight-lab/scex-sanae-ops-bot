@@ -1,0 +1,10 @@
+{
+  "_说明": "填写 QQ 号字符串；高危命令仅 owner/admins 可用。",
+  "owner": ["YOUR_QQ_NUMBER"],
+  "admins": [],
+  "permissions": {
+    "adminCommands": ["tps", "backup", "save", "seed", "weather", "say", "cmd"],
+    "readonlyCommands": ["help", "list", "day", "rules", "version", "uptime", "ip"]
+  }
+}
+

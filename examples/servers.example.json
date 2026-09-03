@@ -1,0 +1,19 @@
+{
+  "servers": [
+    {
+      "id": "legacy",
+      "name": "SCEX Legacy Genesis",
+      "prefix": "[怀旧]",
+      "aliases": ["怀旧", "legacy"],
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 25575,
+      "password_file": "./secrets/rcon-legacy.txt",
+      "server_dir": "D:/Minecraft/SCEX-LegacyGenesis",
+      "address": "example.invalid:25565",
+      "bluemap_web": "http://127.0.0.1:8100",
+      "bluemap_map_source": "world"
+    }
+  ]
+}
+
