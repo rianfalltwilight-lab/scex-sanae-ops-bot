@@ -20,5 +20,10 @@ $env:SOCIAL_STICKER_COOLDOWN = '45'
 
 $env:DEEPSEEK_TEXT_MODEL = 'deepseek-v4-flash'
 $env:DEEPSEEK_REASONING_EFFORT = 'low'
+$env:SANAE_TEXT_PROVIDER = 'deepseek' # 改为 gemini 时走原生 generateContent
+$env:GOOGLE_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com'
+$env:GEMINI_MODEL = 'gemini-3.8-flash'
+$env:GEMINI_THINKING_LEVEL = 'low'
+# GEMINI_API_KEY 不要写入此文件；生产环境请存入私有 secrets.json 的 gemini_api_key。
 $env:ZHIPU_VISION_MODEL = 'glm-4.5v-flash'
 $env:RELAY_G2S = '1'

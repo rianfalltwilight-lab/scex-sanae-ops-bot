@@ -72,6 +72,11 @@ Copy-Item .\start.example.ps1 .\start.ps1
 - `qq-admins.json`：owner 和管理员；
 - `env.ps1`：OneBot API、目标群、机器人 QQ 和开关。
 
+文本模型支持 DeepSeek 的 OpenAI 兼容接口，或原生 Gemini `generateContent`。切换 Gemini 时把
+`SANAE_TEXT_PROVIDER` 设为 `gemini`，配置 `GOOGLE_GEMINI_BASE_URL`、`GEMINI_MODEL` 和
+`GEMINI_THINKING_LEVEL`，并只在未跟踪的 `secrets.json` 中保存 `gemini_api_key`。代码不会在
+Gemini 失败时偷偷回落到另一个 provider。
+
 先在测试群和测试服验证，再运行：
 
 ```powershell
@@ -107,4 +112,3 @@ README 的许可证状态与生产快照记录存在差异，因此本仓库保�
 
 这是一份真实生产系统的脱敏公开版，仍可能包含只适合 SCEX 的假设。欢迎提交 Issue 和
 非商业用途的改进，但请勿附带任何真实 token、QQ 信息、玩家信息或服务器日志。
-

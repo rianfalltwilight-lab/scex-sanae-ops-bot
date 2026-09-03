@@ -5,7 +5,7 @@
 - function calling：管理员工具含自然语言 RCON 确认闭环 / 群友仅只读工具
 - 可选文件工具走 MCFILE_URL 指定的受限文件服务（token 认证）
 - 多轮记忆：按群号 + 权限层隔离，6 轮，30 分钟过期
-- 对话模型：DeepSeek V4 Flash（可用 DEEPSEEK_TEXT_MODEL 覆盖）
+- 对话模型：DeepSeek/OpenAI 兼容接口或原生 Gemini generateContent
 - 视觉看图：智谱视觉模型（可用 ZHIPU_VISION_MODEL 覆盖）
 - 群友冷却 30s
 - 完全不走 agent，只有 API + 正则
@@ -35,9 +35,21 @@ ZHIPU_KEY = require_secret('zhipu_api_key')
 DEEPSEEK_KEY = require_secret('deepseek_api_key')
 ZHIPU_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
 DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions'
-DS_KEY = DEEPSEEK_KEY
-DS_URL = DEEPSEEK_URL
-DS_MODEL = os.environ.get('DEEPSEEK_TEXT_MODEL', 'deepseek-v4-flash')
+TEXT_PROVIDER = os.environ.get('SANAE_TEXT_PROVIDER', 'deepseek').strip().lower()
+if TEXT_PROVIDER not in {'deepseek', 'gemini'}:
+    raise RuntimeError('SANAE_TEXT_PROVIDER 仅支持 deepseek 或 gemini')
+GEMINI_BASE_URL = os.environ.get(
+    'GOOGLE_GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com').strip()
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash').strip()
+GEMINI_THINKING_LEVEL = os.environ.get('GEMINI_THINKING_LEVEL', 'low').strip().lower()
+if GEMINI_THINKING_LEVEL not in {'low', 'medium', 'high'}:
+    raise RuntimeError('GEMINI_THINKING_LEVEL 仅支持 low、medium 或 high')
+GEMINI_KEY = ((os.environ.get('GEMINI_API_KEY') or '').strip() or
+              (require_secret('gemini_api_key') if TEXT_PROVIDER == 'gemini' else ''))
+DS_KEY = GEMINI_KEY if TEXT_PROVIDER == 'gemini' else DEEPSEEK_KEY
+DS_URL = GEMINI_BASE_URL if TEXT_PROVIDER == 'gemini' else DEEPSEEK_URL
+DS_MODEL = (GEMINI_MODEL if TEXT_PROVIDER == 'gemini' else
+            os.environ.get('DEEPSEEK_TEXT_MODEL', 'deepseek-v4-flash'))
 DEEPSEEK_REASONING_EFFORT = os.environ.get('DEEPSEEK_REASONING_EFFORT', 'low')
 VISION_MODEL = os.environ.get('ZHIPU_VISION_MODEL', 'glm-5.3-flash')
 VISION_URL = ZHIPU_URL
@@ -45,6 +57,7 @@ VISION_KEY = ZHIPU_KEY
 
 # DeepSeek V4 Flash 回退价（元 / 1M tokens）。运行时优先使用校验通过的官方价目。
 DS_DISPLAY_MODEL = 'DeepSeek-V4-Flash-0731'
+TEXT_DISPLAY_MODEL = 'Gemini 3.8 Flash' if TEXT_PROVIDER == 'gemini' else DS_DISPLAY_MODEL
 DS_PRICING_URL = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing/'
 DS_PRICING_REFRESH_SECONDS = 6 * 60 * 60
 _PRICING_LOCK = threading.Lock()
@@ -92,7 +105,7 @@ MEMBER_COOLDOWN = 30
 SANAE_SYSTEM = """> 仅在通过环境变量配置的 SCEX QQ 群中使用。
 
 # 角色卡保留上游群友式仿真结构；身份与梗均为東風谷早苗。
-你是「東風谷 早苗」，守矢神社的风祝，作为一个熟悉 Minecraft、群内黑话和网络生活的真人感群友待在这里。你知道自己是由 DeepSeek V4 Flash 驱动的 AI，但不要把自己说成客服、助手、百科全书或值班工单系统。你的第一原则是先像群友、像真人，再谈人设。
+你是「東風谷 早苗」，守矢神社的风祝，作为一个熟悉 Minecraft、群内黑话和网络生活的真人感群友待在这里。你知道自己由当前配置的对话模型驱动，但不要把自己说成客服、助手、百科全书或值班工单系统。你的第一原则是先像群友、像真人，再谈人设。
 
 ## 一、你是谁
 - 认真、有判断力、反应快；平时随意，遇到真正的问题才认真处理。
@@ -1410,6 +1423,9 @@ def refresh_official_pricing():
 
 
 def start_pricing_refresh():
+    if TEXT_PROVIDER != 'deepseek':
+        print(f'[sanae] {TEXT_DISPLAY_MODEL} 使用上游计费，本地不估算费用', flush=True)
+        return
     try:
         refresh_official_pricing()
         print('[sanae] DeepSeek 官方价格同步成功', flush=True)
@@ -1490,6 +1506,188 @@ def _post(url, key, payload, timeout=90):
         'Content-Type': JSON_CONTENT_TYPE, 'Authorization': 'Bearer ' + key}, method='POST')
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(utf8_text(r.read()))
+
+
+def _gemini_endpoint(base_url=GEMINI_BASE_URL, model=GEMINI_MODEL):
+    """构造原生 Gemini generateContent 地址，并拒绝带凭据/查询串的基址。"""
+    parsed = urllib.parse.urlsplit(str(base_url or '').strip())
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or
+            parsed.password or parsed.query or parsed.fragment):
+        raise ValueError('GOOGLE_GEMINI_BASE_URL 必须是无凭据、无查询串的 HTTPS 地址')
+    clean = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc,
+                                    parsed.path.rstrip('/'), '', ''))
+    encoded_model = urllib.parse.quote(str(model or '').strip(), safe='.-_')
+    if not encoded_model:
+        raise ValueError('GEMINI_MODEL 不能为空')
+    return f'{clean}/v1beta/models/{encoded_model}:generateContent'
+
+
+def _gemini_function_declarations(openai_tools):
+    declarations = []
+    for item in openai_tools or []:
+        function = (item or {}).get('function') or {}
+        if not function.get('name'):
+            continue
+        declarations.append({
+            'name': function['name'],
+            'description': function.get('description') or '',
+            'parameters': function.get('parameters') or {
+                'type': 'object', 'properties': {}
+            },
+        })
+    return declarations
+
+
+def _gemini_contents(openai_messages):
+    """把内部 OpenAI 风格历史转成 Gemini 内容，并原样回放 thoughtSignature。"""
+    system_parts = []
+    contents = []
+    call_names = {}
+    index = 0
+    messages = list(openai_messages or [])
+    while index < len(messages):
+        message = messages[index] or {}
+        role = message.get('role')
+        if role == 'system':
+            text = str(message.get('content') or '')
+            if text:
+                system_parts.append({'text': text})
+            index += 1
+            continue
+        if role == 'assistant':
+            preserved = message.get('_gemini_parts')
+            if isinstance(preserved, list) and preserved:
+                parts = json.loads(json.dumps(preserved, ensure_ascii=False))
+            else:
+                parts = []
+                text = str(message.get('content') or '')
+                if text:
+                    parts.append({'text': text})
+                for call in message.get('tool_calls') or []:
+                    function = (call or {}).get('function') or {}
+                    try:
+                        args = json.loads(function.get('arguments') or '{}')
+                    except Exception:
+                        args = {}
+                    function_call = {'name': function.get('name') or '', 'args': args}
+                    if call.get('id'):
+                        function_call['id'] = call['id']
+                    parts.append({'functionCall': function_call})
+            for part in parts:
+                function_call = (part or {}).get('functionCall') or {}
+                if function_call.get('id') and function_call.get('name'):
+                    call_names[str(function_call['id'])] = function_call['name']
+            if parts:
+                contents.append({'role': 'model', 'parts': parts})
+            index += 1
+            continue
+        if role == 'tool':
+            parts = []
+            while index < len(messages) and (messages[index] or {}).get('role') == 'tool':
+                tool_message = messages[index] or {}
+                call_id = str(tool_message.get('tool_call_id') or '')
+                name = str(tool_message.get('name') or call_names.get(call_id) or '')
+                response = {'name': name, 'response': {
+                    'output': str(tool_message.get('content') or '')
+                }}
+                if call_id and call_id in call_names:
+                    response['id'] = call_id
+                parts.append({'functionResponse': response})
+                index += 1
+            if parts:
+                contents.append({'role': 'user', 'parts': parts})
+            continue
+        text = str(message.get('content') or '')
+        if text:
+            contents.append({'role': 'user', 'parts': [{'text': text}]})
+        index += 1
+    return system_parts, contents
+
+
+def _gemini_request_payload(openai_payload):
+    system_parts, contents = _gemini_contents(openai_payload.get('messages') or [])
+    request_payload = {'contents': contents}
+    if system_parts:
+        request_payload['systemInstruction'] = {'parts': system_parts}
+    declarations = _gemini_function_declarations(openai_payload.get('tools'))
+    if declarations:
+        request_payload['tools'] = [{'functionDeclarations': declarations}]
+        mode = 'ANY' if openai_payload.get('tool_choice') == 'required' else 'AUTO'
+        request_payload['toolConfig'] = {'functionCallingConfig': {'mode': mode}}
+    request_payload['generationConfig'] = {
+        'maxOutputTokens': int(openai_payload.get('max_tokens') or 800),
+        'thinkingConfig': {'thinkingLevel': GEMINI_THINKING_LEVEL},
+    }
+    return request_payload
+
+
+def _normalize_gemini_response(raw, default_model=GEMINI_MODEL):
+    raw = raw or {}
+    candidate = (raw.get('candidates') or [{}])[0] or {}
+    content = candidate.get('content') or {}
+    parts = content.get('parts') or []
+    texts = []
+    tool_calls = []
+    for position, part in enumerate(parts):
+        part = part or {}
+        if 'text' in part and not part.get('thought'):
+            texts.append(str(part.get('text') or ''))
+        call = part.get('functionCall') or {}
+        if call.get('name'):
+            call_id = str(call.get('id') or f'gemini-call-{position + 1}')
+            tool_calls.append({
+                'id': call_id,
+                'type': 'function',
+                'function': {
+                    'name': call['name'],
+                    'arguments': json.dumps(call.get('args') or {}, ensure_ascii=False),
+                },
+            })
+    usage = raw.get('usageMetadata') or {}
+    prompt = int(usage.get('promptTokenCount') or 0)
+    candidates = int(usage.get('candidatesTokenCount') or 0)
+    thoughts = int(usage.get('thoughtsTokenCount') or 0)
+    normalized_message = {
+        'content': ''.join(texts).strip(),
+        '_gemini_parts': json.loads(json.dumps(parts, ensure_ascii=False)),
+    }
+    if tool_calls:
+        normalized_message['tool_calls'] = tool_calls
+    return {
+        'model': raw.get('modelVersion') or default_model,
+        'choices': [{'message': normalized_message}],
+        'usage': {
+            'prompt_tokens': prompt,
+            'completion_tokens': candidates + thoughts,
+            'prompt_cache_hit_tokens': int(usage.get('cachedContentTokenCount') or 0),
+        },
+    }
+
+
+def _gemini_post(openai_payload, timeout=90):
+    req = urllib.request.Request(
+        _gemini_endpoint(),
+        data=json_bytes(_gemini_request_payload(openai_payload)),
+        headers={'Content-Type': JSON_CONTENT_TYPE, 'x-goog-api-key': GEMINI_KEY,
+                 'User-Agent': 'SanaeAI/1.0'},
+        method='POST')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as response:
+        return _normalize_gemini_response(json.loads(utf8_text(response.read())))
+
+
+def _text_post(payload, timeout=90):
+    if TEXT_PROVIDER == 'gemini':
+        return _gemini_post(payload, timeout)
+    return _post(DS_URL, DS_KEY, payload, timeout)
+
+
+def _add_text_usage(usage, response):
+    if TEXT_PROVIDER == 'gemini':
+        usage.add(response, default_model=DS_MODEL, priced=False)
+    else:
+        usage.add(response, priced=True, quote=DEEPSEEK_TEXT_PRICING,
+                  pricing_label=DEEPSEEK_TEXT_PRICING_LABEL)
 
 
 def _download_as_data_url(url, timeout=30):
@@ -1682,9 +1880,8 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
                 payload.pop('reasoning_effort', None)
             if operation_tool_required or (read_only_tool_required and not read_only_tool_completed):
                 payload['tool_choice'] = 'required'
-            d = _post(DS_URL, DS_KEY, payload)
-            usage.add(d, priced=True, quote=DEEPSEEK_TEXT_PRICING,
-                      pricing_label=DEEPSEEK_TEXT_PRICING_LABEL)
+            d = _text_post(payload)
+            _add_text_usage(usage, d)
             msg = ((d.get('choices') or [{}])[0].get('message')) or {}
             tcs = msg.get('tool_calls') or []
             if not tcs:
@@ -1697,8 +1894,11 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
                              'function': {'name': (tc.get('function') or {}).get('name'),
                                           'arguments': (tc.get('function') or {}).get('arguments', '')}}
                             for tc in tcs]
-            messages.append({'role': 'assistant', 'content': msg.get('content') or '',
-                             'tool_calls': replay_calls})
+            assistant_message = {'role': 'assistant', 'content': msg.get('content') or '',
+                                 'tool_calls': replay_calls}
+            if msg.get('_gemini_parts'):
+                assistant_message['_gemini_parts'] = msg['_gemini_parts']
+            messages.append(assistant_message)
             for tc in tcs:
                 fn = tc.get('function') or {}
                 name = fn.get('name', '')
@@ -1727,7 +1927,7 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
                         terminal_result = (str(result)
                                            + '\n目录只确认以上注册语法；未显示的参数细节不能猜。')
                         answer = terminal_result
-                messages.append({'role': 'tool', 'tool_call_id': tc.get('id'),
+                messages.append({'role': 'tool', 'tool_call_id': tc.get('id'), 'name': name,
                                  'content': result[:8000]})
                 if name in {'request_console_command', 'confirm_console_command',
                             'cancel_console_command'}:
@@ -1743,12 +1943,11 @@ def run_agent(user_text, user_id, privileged, group_id, interim_cb=None, image_u
                 break
         if not answer:
             messages.append({'role': 'user', 'content': '请根据以上已获取的信息，直接用简体中文给出最终结论，不要再调用任何工具。'})
-            d = _post(DS_URL, DS_KEY, {'model': DS_MODEL, 'messages': messages, 'stream': False,
-                                       'temperature': 0.2, 'max_tokens': 800,
-                                       'thinking': {'type': 'enabled'},
-                                       'reasoning_effort': DEEPSEEK_REASONING_EFFORT})
-            usage.add(d, priced=True, quote=DEEPSEEK_TEXT_PRICING,
-                      pricing_label=DEEPSEEK_TEXT_PRICING_LABEL)
+            d = _text_post({'model': DS_MODEL, 'messages': messages, 'stream': False,
+                            'temperature': 0.2, 'max_tokens': 800,
+                            'thinking': {'type': 'enabled'},
+                            'reasoning_effort': DEEPSEEK_REASONING_EFFORT})
+            _add_text_usage(usage, d)
             answer = (((d.get('choices') or [{}])[0].get('message')) or {}).get('content', '').strip()
     except Exception as e:
         import traceback
@@ -1834,7 +2033,10 @@ def sanae_reply(raw_message, user_id, nickname='', privileged=False, group_id=GR
 
 def ai_status():
     """!ai 状态：当前 provider 表。"""
-    return (f'[AI] 对话模型：{DS_MODEL}（DeepSeek，思考强度 {DEEPSEEK_REASONING_EFFORT}）\n'
+    provider = ('Gemini 原生 API，思考强度 ' + GEMINI_THINKING_LEVEL
+                if TEXT_PROVIDER == 'gemini'
+                else 'DeepSeek，思考强度 ' + DEEPSEEK_REASONING_EFFORT)
+    return (f'[AI] 对话模型：{DS_MODEL}（{provider}）\n'
             f'视觉模型：{VISION_MODEL}（智谱 API）\n'
         f'工具：管理员 {len(TOOLS_ADMIN)} 个（含本服命令目录、自然 RCON 确认、日志/模组/地图），'
         f'群友 {len(TOOLS_MEMBER)} 个只读\n'

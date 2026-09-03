@@ -78,6 +78,88 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertEqual(payload['thinking'], {'type': 'enabled'})
         self.assertEqual(payload['reasoning_effort'], 'low')
 
+    def test_gemini_endpoint_is_native_and_rejects_unsafe_base(self):
+        self.assertEqual(
+            'https://example.invalid/v1beta/models/gemini-3.8-flash:generateContent',
+            s._gemini_endpoint('https://example.invalid', 'gemini-3.8-flash'))
+        for base in ('http://example.invalid', 'https://user@example.invalid',
+                     'https://example.invalid?key=secret'):
+            with self.assertRaises(ValueError):
+                s._gemini_endpoint(base, 'gemini-3.8-flash')
+
+    def test_gemini_payload_maps_system_tools_and_low_thinking(self):
+        payload = s._gemini_request_payload({
+            'messages': [
+                {'role': 'system', 'content': '系统约束'},
+                {'role': 'user', 'content': '查在线人数'},
+            ],
+            'tools': [s.RUN_RCON_RO],
+            'tool_choice': 'required',
+            'temperature': 0.2,
+            'max_tokens': 800,
+        })
+        self.assertEqual('系统约束', payload['systemInstruction']['parts'][0]['text'])
+        self.assertEqual('查在线人数', payload['contents'][0]['parts'][0]['text'])
+        declaration = payload['tools'][0]['functionDeclarations'][0]
+        self.assertEqual('run_rcon', declaration['name'])
+        self.assertEqual('ANY', payload['toolConfig']['functionCallingConfig']['mode'])
+        self.assertEqual('low', payload['generationConfig']['thinkingConfig']['thinkingLevel'])
+        self.assertNotIn('temperature', payload['generationConfig'])
+
+    def test_gemini_response_preserves_thought_signature_and_groups_tool_results(self):
+        raw = {
+            'modelVersion': 'gemini-3.8-flash',
+            'candidates': [{'content': {'role': 'model', 'parts': [
+                {'functionCall': {'id': 'call-1', 'name': 'run_rcon',
+                                  'args': {'command': 'list'}},
+                 'thoughtSignature': 'opaque-signature'},
+                {'functionCall': {'id': 'call-2', 'name': 'read_recent_chat',
+                                  'args': {'count': 2}}},
+            ]}}],
+            'usageMetadata': {'promptTokenCount': 20, 'candidatesTokenCount': 3,
+                              'thoughtsTokenCount': 4, 'cachedContentTokenCount': 5},
+        }
+        normalized = s._normalize_gemini_response(raw)
+        message = normalized['choices'][0]['message']
+        self.assertEqual('opaque-signature', message['_gemini_parts'][0]['thoughtSignature'])
+        self.assertEqual(7, normalized['usage']['completion_tokens'])
+        system, contents = s._gemini_contents([
+            {'role': 'system', 'content': '系统'},
+            {'role': 'user', 'content': '查询'},
+            {'role': 'assistant', 'content': '',
+             'tool_calls': message['tool_calls'],
+             '_gemini_parts': message['_gemini_parts']},
+            {'role': 'tool', 'tool_call_id': 'call-1', 'name': 'run_rcon',
+             'content': '在线 1 人'},
+            {'role': 'tool', 'tool_call_id': 'call-2', 'name': 'read_recent_chat',
+             'content': '最近消息'},
+        ])
+        self.assertEqual([{'text': '系统'}], system)
+        self.assertEqual('opaque-signature', contents[1]['parts'][0]['thoughtSignature'])
+        self.assertEqual(2, len(contents[2]['parts']))
+        self.assertEqual('call-1', contents[2]['parts'][0]['functionResponse']['id'])
+
+    def test_gemini_post_uses_api_key_header_without_query_secret(self):
+        native = {'modelVersion': 'gemini-3.8-flash',
+                  'candidates': [{'content': {'parts': [{'text': '好'}]}}],
+                  'usageMetadata': {}}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            __import__('json').dumps(native, ensure_ascii=False).encode('utf-8'))
+        response.__exit__.return_value = False
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(s, 'GEMINI_BASE_URL', 'https://example.invalid'), \
+             mock.patch.object(s, 'GEMINI_KEY', 'test-secret'), \
+             mock.patch.object(s.urllib.request, 'build_opener', return_value=opener) as build:
+            result = s._gemini_post({'messages': [{'role': 'user', 'content': '你好'}]})
+        request = opener.open.call_args.args[0]
+        self.assertIsInstance(build.call_args.args[0], s.urllib.request.ProxyHandler)
+        self.assertNotIn('test-secret', request.full_url)
+        self.assertEqual('test-secret', request.get_header('X-goog-api-key'))
+        self.assertEqual('SanaeAI/1.0', request.get_header('User-agent'))
+        self.assertEqual('好', result['choices'][0]['message']['content'])
+
     def test_official_pricing_parser_requires_complete_snapshot(self):
         page = """DeepSeek-V4-Flash DeepSeek-V4-Pro
         百万 tokens 输入（缓存命中） 空闲时段 0.05元 0.15元 高峰时段 0.10元 0.30元
