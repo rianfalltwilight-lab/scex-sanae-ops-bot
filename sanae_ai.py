@@ -1069,7 +1069,13 @@ def _download_modrinth_and_send_group(project, game_version, loader):
 # ===== BlueMap 网页地图截图（双服）=====
 BLUEMAP_DISTANCE = 50
 BLUEMAP_TILT = 0.8
-EDGE_EXE = os.environ.get('EDGE_EXE', '/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe')
+_DEFAULT_EDGE_EXE = (
+    os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+    if os.name == 'nt'
+    else '/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
+)
+EDGE_EXE = os.environ.get('EDGE_EXE', _DEFAULT_EDGE_EXE)
 BLUEMAP_SHOT_DIR = os.environ.get(
     'BLUEMAP_SHOT_DIR', os.path.join(os.path.dirname(__file__), 'state', 'bluemap-shots'))
 
@@ -1147,9 +1153,12 @@ def _send_group_image(win_path, prefix):
 
 
 def parse_bluemap_request(raw):
-    """识别 ``!截图 [服] 玩家``、服前置以及简短自然语言。"""
-    text = re.sub(r'\[CQ:[^\]]*\]', ' ', str(raw or '')).strip()
+    """识别截图命令，以及 ``@早苗 看看玩家名`` 一类自然点名。"""
+    original = str(raw or '')
+    was_at = bool(re.search(r'\[CQ:at\b[^\]]*\]', original, re.I))
+    text = re.sub(r'\[CQ:[^\]]*\]', ' ', original).strip()
     server, text = extract_server_selector(text)
+    had_server_selector = server is not None
     if server is None:
         natural = re.match(
             r'^\s*(怀旧服?|legacy)\s*(?:服)?\s*(?:的)?\s*(?:地图)?截图\s*(.*)$',
@@ -1167,9 +1176,26 @@ def parse_bluemap_request(raw):
                 server = resolve_server(natural.group(1))
                 text = '截图 ' + natural.group(2)
     match = re.match(r'^\s*[!！]?\s*(?:地图)?截图\s*(?:玩家)?\s*@?([A-Za-z0-9_]*)\s*$', text, re.I)
-    if not match:
+    if match:
+        return {'server': server, 'player': match.group(1)}
+
+    # “看看 X” 很像普通聊天，只在 @早苗、自然点名、明确选服或使用
+    # “看人”时接管；候选必须是合法 Minecraft 用户名，避免截走日常聊天。
+    named_call = bool(re.match(r'^\s*早苗(?:\s|[，,：:。！？!?、]|$)', text))
+    if named_call:
+        text = re.sub(r'^\s*早苗(?:\s|[，,：:。！？!?、])+', '', text, count=1).strip()
+    natural = re.match(
+        r'^\s*(?:帮我\s*)?(看人|看看|看下|看一下|瞅瞅)\s*(?:一下\s*)?'
+        r'(?:玩家\s*)?@?([A-Za-z0-9_]{1,16})\s*[。！!？?]?\s*$',
+        text, re.I)
+    if not natural:
         return None
-    return {'server': server, 'player': match.group(1)}
+    if not (was_at or named_call or had_server_selector or natural.group(1) == '看人'):
+        return None
+    player = natural.group(2)
+    if player.casefold() in {'tps', 'mspt', 'status', 'server', 'log', 'logs', 'help', 'cmd'}:
+        return None
+    return {'server': server, 'player': player}
 
 
 def _route_screenshot_player(player, server=None, query_fn=None):
@@ -1216,6 +1242,11 @@ def _probe_bluemap(server):
 def _windows_path_to_wsl(path):
     match = re.match(r'^([A-Za-z]):/(.*)$', path.replace('\\', '/'))
     return f'/mnt/{match.group(1).lower()}/{match.group(2)}' if match else path
+
+
+def _runtime_file_path(path):
+    """截图由当前 Python 校验：Windows 直接读盘，WSL 才转换盘符。"""
+    return path if os.name == 'nt' else _windows_path_to_wsl(path)
 
 
 def handle_bluemap_request(raw):
@@ -1265,10 +1296,10 @@ def _bluemap_shot(player, server=None):
         if p.returncode != 0:
             err = (p.stderr or b'').decode('utf-8', 'replace').strip()
             return f'{prefix} 生成地图截图失败：{err[:160] or ("Edge 退出码 " + str(p.returncode))}'
-        wsl_png = _windows_path_to_wsl(png)
-        if not os.path.exists(wsl_png) or os.path.getsize(wsl_png) < 1024:
+        runtime_png = _runtime_file_path(png)
+        if not os.path.exists(runtime_png) or os.path.getsize(runtime_png) < 1024:
             return f'{prefix} 截图 PNG 未生成或尺寸无效。'
-        with open(wsl_png, 'rb') as image_file:
+        with open(runtime_png, 'rb') as image_file:
             if image_file.read(8) != b'\x89PNG\r\n\x1a\n':
                 return f'{prefix} 截图文件不是有效 PNG，已拒绝发送。'
         _send_group_image(png, prefix)

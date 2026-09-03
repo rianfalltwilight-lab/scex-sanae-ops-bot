@@ -126,6 +126,28 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertFalse(s._has_console_command_intent('看看怀旧服蓝图有哪些指令'))
         self.assertFalse(s._has_confirmation_intent('不要执行，取消'))
 
+    def test_natural_player_look_routes_to_bluemap(self):
+        cases = (
+            ('[CQ:at,qq=1002] 看看ExamplePlayer', None, 'ExamplePlayer'),
+            ('早苗，看看 ExamplePlayer', None, 'ExamplePlayer'),
+            ('看人 ExamplePlayer', None, 'ExamplePlayer'),
+            ('[怀旧] 看下玩家 ExamplePlayer', 'legacy', 'ExamplePlayer'),
+        )
+        for raw, server_id, player in cases:
+            parsed = s.parse_bluemap_request(raw)
+            self.assertIsNotNone(parsed, raw)
+            self.assertEqual(server_id, parsed['server']['id'] if parsed['server'] else None)
+            self.assertEqual(player, parsed['player'])
+
+    def test_natural_player_look_does_not_hijack_chat_or_ops(self):
+        for raw in ('看看ExamplePlayer', '[CQ:at,qq=1002] 看看TPS', '早苗，看看日志', '看看这个'):
+            self.assertIsNone(s.parse_bluemap_request(raw), raw)
+
+    def test_screenshot_runtime_path_is_native_on_windows(self):
+        with mock.patch.object(s.os, 'name', 'nt'):
+            self.assertEqual('C:/Users/Public/shot.png',
+                             s._runtime_file_path('C:/Users/Public/shot.png'))
+
     def test_live_server_query_intent_requires_fresh_tool_evidence(self):
         self.assertTrue(s._has_server_query_intent('现在怀旧服多少天了'))
         self.assertTrue(s._has_server_query_intent('早苗，服里在线几个人'))
