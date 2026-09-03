@@ -387,6 +387,16 @@ def _natural_server_operation_candidate(raw, privileged, direct_call=False, at_c
     return bool(privileged and _sanae_ai._has_console_command_intent(raw) and
                 (direct_call or at_call or mentions_server or command_subject))
 
+
+def _is_ai_operation_turn(raw, privileged):
+    """运维意图必须只使用当前消息，不能混入社交记忆和风格提示。"""
+    return bool(
+        _sanae_ai._has_server_query_intent(raw) or
+        (privileged and (
+            _sanae_ai._has_console_command_intent(raw) or
+            _sanae_ai._has_confirmation_intent(raw) or
+            _sanae_ai._has_cancellation_intent(raw))))
+
 # ===== MC 百科查询（!wiki/!百科 → mcmod.cn）=====
 _WIKI_PATTERNS = [
     re.compile(r'^!?\s*wiki\s+(.+)$', re.I),
@@ -1109,7 +1119,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     print(f'[sanae] interim 失败: {e}', flush=True)
 
             selected_server, raw, target_unambiguous = _ai_operation_target(raw, gid, uid)
-            if gid == SOCIAL_LITE_GROUP:
+            # 运维工具的意图识别必须基于干净的当前消息。把长期记忆、黑话或
+            # 风格策略拼进来，会让其中的“解释/说明”等词误关掉 run_rcon。
+            if gid == SOCIAL_LITE_GROUP and not _is_ai_operation_turn(raw, privileged):
                 extras = ['\n〖回复策略〗' + FEEDBACK_STORE.strategy_hint()]
                 slang_context = SLANG_LEARNER.context()
                 if slang_context:

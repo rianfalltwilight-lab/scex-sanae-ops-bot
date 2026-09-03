@@ -260,6 +260,30 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertFalse(b._natural_server_operation_candidate('今天几号', False))
         self.assertFalse(b._natural_server_operation_candidate('给 ExamplePlayer OP', False))
 
+    def test_server_tool_turn_excludes_social_prompt_context(self):
+        self.assertTrue(b._is_ai_operation_turn(
+            '[CQ:at,qq=1002] 服务器在线人数多少', False))
+        self.assertTrue(b._is_ai_operation_turn('怀旧服给 ExamplePlayer OP', True))
+        self.assertFalse(b._is_ai_operation_turn('这句话是什么意思', False))
+
+        event = {
+            'raw_message': '[CQ:at,qq=1002] 服务器在线人数多少',
+            'user_id': 1003, 'group_id': b.SOCIAL_LITE_GROUP,
+            'sender': {'nickname': 'member'},
+        }
+        with mock.patch.object(b, '_ai_operation_target', return_value=(
+                {'id': 'legacy', 'prefix': '[怀旧]'}, event['raw_message'], True)), \
+             mock.patch.object(b._sanae_ai, 'sanae_reply', return_value='当前在线 2 人') as reply, \
+             mock.patch.object(b, 'send_group_msg', return_value=True), \
+             mock.patch.object(b.FEEDBACK_STORE, 'strategy_hint', return_value='说明：闲聊'), \
+             mock.patch.object(b.SLANG_LEARNER, 'context', return_value='解释黑话'), \
+             mock.patch.object(b.SOCIAL_MEMORY, 'context', return_value='历史说明'), \
+             mock.patch.object(b.STICKER_CATALOG, 'recommend', return_value=[]):
+            b.BridgeHandler._sanae_reply_thread(None, event, True)
+        prompt = reply.call_args.args[0]
+        self.assertEqual(event['raw_message'], prompt)
+        self.assertNotIn('回复策略', prompt)
+
     def test_rcon_dispatch_uses_per_server_backend(self):
         calls = []
 
