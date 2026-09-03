@@ -155,6 +155,22 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertFalse(s._has_server_query_intent('TPS 是什么意思'))
         self.assertFalse(s._has_server_query_intent('今天几号'))
 
+    def test_live_server_query_bypasses_social_member_cooldown_only(self):
+        server = {'id': 'legacy', 'name': 'Legacy', 'prefix': '[怀旧]'}
+        s._LAST_MEMBER['member'] = s.time.time()
+        with mock.patch.object(s, 'run_agent', return_value=('当前在线 2 人', mock.Mock(), True)) as run:
+            answer = s.sanae_reply(
+                '[CQ:at,qq=1002] 在线人数', 'member', privileged=False,
+                force=True, selected_server=server, explicit_server=True,
+                include_usage_footer=False)
+            blocked = s.sanae_reply(
+                '[CQ:at,qq=1002] 普通聊天', 'member', privileged=False,
+                force=True, selected_server=server, explicit_server=True,
+                include_usage_footer=False)
+        self.assertEqual('当前在线 2 人', answer)
+        self.assertIsNone(blocked)
+        self.assertEqual(1, run.call_count)
+
     def test_world_day_query_forces_one_rcon_call_then_summarizes(self):
         replies = iter([
             {'choices': [{'message': {'content': '', 'tool_calls': [{

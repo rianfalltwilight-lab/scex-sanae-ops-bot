@@ -1801,7 +1801,12 @@ def sanae_reply(raw_message, user_id, nickname='', privileged=False, group_id=GR
         return None
     if should_ignore(raw_message) and not force:
         return None
-    if not privileged and not _member_cooldown_ok(user_id):
+    # 实时只读服况是可审计的工具任务，不应被普通闲聊的 30 秒冷却静默。
+    # social_only 仍严格走冷却，避免扩大自然聊天回复频率。
+    live_server_query = bool(
+        selected_server is not None and not social_only and
+        _has_server_query_intent(raw_message))
+    if not privileged and not live_server_query and not _member_cooldown_ok(user_id):
         return None  # 冷却中，静默
     text = re.sub(r'\[CQ:[^\]]*\]', '', raw_message).strip()
     text = re.sub(r'@東風谷\s*早苗|@早苗', '', text).strip()
