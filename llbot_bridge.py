@@ -23,7 +23,8 @@ import unicodedata
 import difflib
 import urllib.request
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
+from bridge_runtime import CallbackServer, start_worker as _start_worker, start_ai_worker as _start_ai_worker
 
 # 同目录导入依赖模块（systemd 启动时工作目录可能不是脚本目录，显式加 sys.path）
 import os as _os
@@ -38,6 +39,7 @@ from server_registry import (clear_selected, extract_server_selector,
                              get_selected, list_servers, query_server, resolve_server,
                              select_server, server_hint, server_prefix)
 from ops_commands import STATE_BASE as OPS_STATE_BASE, dispatch_ops_command, match_ops_command
+from nast_ops_sync import sync_if_stale
 
 # 模组查询模块（CF 站 + M 站 + 自动翻译）
 from local_secrets import require_secret as _require_secret
@@ -59,7 +61,8 @@ from social_memory import SocialMemory
 import rcon_ops as _rcon_ops
 from player_bindings import PlayerBindings
 from media_segments import media_segments
-from media_ai import image_host_upload, _download
+from media_ai import image_host_upload, _download, analyze_media as _analyze_media, media_fingerprints
+from request_runtime import Budget, bounded_call, RequestTimeout, RequestBusy
 
 # ===== 基本配置 =====
 LLBOT_GROUP = int(_os.environ.get('LLBOT_GROUP', '0'))
@@ -82,6 +85,7 @@ FUN_MUTE_SECONDS = max(60, min(3600, int(_os.environ.get('FUN_MUTE_SECONDS', '30
 GROUP_CHAT_ENABLED = _os.environ.get('GROUP_CHAT_ENABLED', '1') == '1'
 # 群→双服全量转发开关；生产默认开启，显式 RELAY_G2S=0 才关闭。
 RELAY_G2S_ENABLED = _os.environ.get('RELAY_G2S', '1') != '0'
+OPS_NAST_SYNC_INTERVAL = max(60, int(_os.environ.get('OPS_NAST_SYNC_INTERVAL', '300')))
 
 # Social Lite is scoped to the existing production group only.  It is opt-in
 # and adds no process, account, or agent.
@@ -147,6 +151,22 @@ def _fun_mute_thread(event, reason):
               f'reason={reason} ok=False error={type(exc).__name__}', flush=True)
 
 
+def _refresh_nast_ops():
+    """Best-effort restricted snapshot refresh; never expose payload or credentials."""
+    try:
+        result = sync_if_stale(OPS_STATE_BASE, max_age=OPS_NAST_SYNC_INTERVAL)
+        if not result.get('cached'):
+            print('[nast] [ops-sync] refreshed', flush=True)
+        return True
+    except Exception as exc:
+        print(f'[nast] [ops-sync] failed {type(exc).__name__}', flush=True)
+        return False
+
+
+def _nast_ops_sync_loop():
+    while True:
+        _refresh_nast_ops()
+        time.sleep(OPS_NAST_SYNC_INTERVAL)
 PLAYER_BINDINGS_ENABLED = _os.environ.get('PLAYER_BINDINGS_ENABLED', '') == '1'
 PLAYER_BINDINGS = PlayerBindings(_os.environ.get(
     'PLAYER_BINDINGS_PATH', _os.path.join(_BRIDGE_DIR, 'logs', 'qq-player-binds.json')))
@@ -272,23 +292,23 @@ def _selection_reply(raw, group_id, user_id):
             return None
     if clear:
         clear_selected(group_id, user_id)
-        return ('操作目标已清除。未指定目标的在线查询会汇总两服；'
-                '普通群消息仍同步两服。')
+        return ('操作目标已清除。在线查询按当前启用的服务器汇总；'
+                '普通群消息转发仍按现有配置。')
     if show:
         selected, _ = get_selected(group_id, user_id)
         current = (f'{server_prefix(selected)} {selected["name"]}'
-                   if selected else '未设置（在线查询默认汇总两服）')
+                   if selected else '未设置（在线查询按当前启用的服务器汇总）')
         names = [f'{server_prefix(item)} {item["name"]}' for item in list_servers()]
         return ('当前操作目标：' + current + '\n可选：' + '；'.join(names)
-                + '\n切换：!怀旧 / !服 <名称>；清除：!服 自动'
-                + '\n说明：只影响查询和管理，普通群消息仍同步两服。')
+                + '\n切换：!服 <名称>；本条指定：服务器标签 + 命令；清除：!服 自动'
+                + '\n说明：只影响查询和管理，普通群消息转发仍按现有配置。')
     if choice:
         server = resolve_server(choice.group(1))
     if not server:
         return f'{server_hint()} 目标不在允许清单。发送 !服 查看可选项。'
     selected = select_server(group_id, user_id, server['id'])
     return (f'{server_prefix(selected)} 操作目标已设为：{selected["name"]}\n'
-            '只影响查询和管理；普通群消息仍同步两服。')
+            '只影响查询和管理；普通群消息转发仍按现有配置。')
 
 
 def _command_target(raw, group_id, user_id):
@@ -370,22 +390,12 @@ def _pending_natural_operation_reply(raw, user_id, privileged):
 
 
 def _natural_server_operation_candidate(raw, privileged, direct_call=False, at_call=False):
-    """Route explicit live queries and admin imperatives away from social-only mode."""
-    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw or ''), flags=re.I).strip()
-    explicit, _cleaned = extract_natural_server_selector(raw)
-    mentions_server = bool(explicit or re.search(
-        r'(?i)(?:本服|服务器|怀旧服|服里|游戏里|Minecraft|\bMC\b|\bTPS\b)', text))
+    """A server topic is not a request to the bot, even when an admin says it."""
+    if not (direct_call or at_call):
+        return False
     if _sanae_ai._has_server_query_intent(raw):
-        return bool(direct_call or at_call or mentions_server)
-    # Admin mutations remain confirmation-gated in sanae_ai.  Avoid treating a
-    # casual sentence containing a broad verb such as “给” as an operation:
-    # without a direct call/server mention, require a command-shaped subject.
-    command_subject = re.search(
-        r'(?i)(?:\bop\b|管理(?:员|权限)|权限|封禁|解封|白名单|踢出|传送|召唤|'
-        r'重载|重启|停服|备份|\bgive\b|\bfill\b|\bkill\b|\btp\b|\bban\b|'
-        r'\bpardon\b|\bwhitelist\b|(?:^|\s)/[A-Za-z])', text)
-    return bool(privileged and _sanae_ai._has_console_command_intent(raw) and
-                (direct_call or at_call or mentions_server or command_subject))
+        return True
+    return bool(privileged and _sanae_ai._has_console_command_intent(raw))
 
 
 def _is_ai_operation_turn(raw, privileged):
@@ -570,10 +580,135 @@ def _image_host_command(raw, event, uid, privileged):
     return '图床链接：\n' + '\n'.join(results)
 
 
+def _explicit_media_command(raw):
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw)).strip()
+    return bool(re.match(r'^[!！]\s*(?:转写|语音转写|听语音)(?:\s|$)', text))
+
+
+def _event_mentions_sanae(event, raw=None):
+    """Only an at segment for this bot counts; @all and other people do not."""
+    self_id = str(event.get('self_id') or WIKI_BOT_QQ)
+    message = event.get('message')
+    if isinstance(message, list):
+        # Structured segments are authoritative: quoted text resembling CQ
+        # markup must not become a mention or override the actual recipient.
+        return any(isinstance(seg, dict) and seg.get('type') == 'at' and
+                   isinstance(seg.get('data'), dict) and
+                   str(seg['data'].get('qq', '')) == self_id for seg in message)
+    current = str(event.get('raw_message', '') if raw is None else raw)
+    pattern = r'\[CQ:at,qq=' + re.escape(self_id) + r'(?:,|\])'
+    return bool(re.search(pattern, current))
+
+
+def _event_direct_name_call(event):
+    raw = str(event.get('raw_message', '') or '')
+    if not raw or _event_mentions_sanae(event):
+        return False
+    text = re.sub(r'\[CQ:[^\]]*\]', '', raw, flags=re.I).strip()
+    return bool(re.match(r'^早苗(?:\s|[，,：:。！？!?、]|$)', text))
+
+
+def _ai_reply_trigger(event):
+    """Recheck explicit invocation at both queue and worker boundaries.
+
+    force bypasses model-side name matching, never the bridge invocation gate.
+    Ordinary named chat stays in Social Lite; named ops/recall are explicit asks.
+    """
+    raw = str(event.get('raw_message', '') or '')
+    uid = str(event.get('user_id') or '')
+    privileged = uid in OWNERS or uid in ADMINS
+    if _event_mentions_sanae(event):
+        return 'mention-self'
+    if privileged and re.match(r'^[!！]\s*问\s+(.+)$', raw, re.S):
+        return 'ask-command'
+    direct = _event_direct_name_call(event)
+    if direct and _natural_server_operation_candidate(raw, privileged, direct_call=True):
+        return 'direct-name-operation'
+    if direct and _sanae_ai.chat_recall.is_recall(raw):
+        return 'direct-name-recall'
+    if _pending_natural_operation_reply(raw, uid, privileged):
+        return 'pending-confirmation'
+    return ''
+
+
+def _queue_sanae_reply(callback, event, force=False):
+    trigger = _ai_reply_trigger(event)
+    if not trigger:
+        return False
+    queued = _start_ai_worker(callback, args=(event, force))
+    print('[sanae-route] channel=ai trigger={} message_id={} user={} queued={}'.format(
+        trigger, event.get('message_id', ''), event.get('user_id', ''), bool(queued)), flush=True)
+    return queued
+
+
+def _media_request_reason(raw, event):
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw)).strip()
+    if _sanae_ai.chat_recall.is_recall(raw) and not _explicit_media_command(raw) and not re.search(r'图片|看图|视频|语音|音频', text):
+        return ''
+    if not media_segments(event, ('record', 'audio', 'video', 'file', 'reply', 'forward')):
+        return ''
+    if _explicit_media_question(raw):
+        return 'media-command'
+    if _event_mentions_sanae(event, raw):
+        return 'mention-self'
+    if re.match(r'^早苗(?:\s|[，,：:。！？!?、]|$)', text):
+        return 'direct-name'
+    return ''
+
+
 def _media_ai_requested(raw, event):
-    text = _normalize(raw)
-    has_media = bool(media_segments(event, ('record', 'audio', 'video')))
-    return has_media and (text in ('!转写', '!语音转写', '!听语音') or '早苗' in text or '[CQ:at' in raw)
+    return bool(_media_request_reason(raw, event))
+
+
+def _explicit_media_question(raw):
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw)).strip()
+    return _explicit_media_command(raw) or bool(re.match(r'^[!！]\s*问(?:\s|$)', text))
+
+
+def _media_reply_thread(event, raw, uid, gid, privileged):
+    budget = Budget(120)
+    try:
+        result = bounded_call(lambda: _analyze_media(event, WIKI_API, raw, budget), budget=budget, seconds=120)
+        if result['status'] == 'no media' and not _explicit_media_command(raw):
+            answer = _sanae_ai.sanae_reply(raw, uid, privileged=privileged, group_id=gid,
+                                           force=True, request_budget=budget)
+        elif result['evidence']:
+            selected, _, explicit, _ = _command_target(raw, gid, uid)
+            answer = _sanae_ai.sanae_reply(raw, uid, privileged=privileged, group_id=gid, force=True,
+                selected_server=selected, explicit_server=explicit, request_budget=budget,
+                evidence=result['evidence'], media_fingerprints=result['fingerprints'])
+            if answer and result['usage']:
+                answer += '\n' + result['usage']
+        else:
+            answer = ('没有找到可处理的语音或视频。' if result['status'] == 'no media' else result['status'])
+            answer += ('\n' + result['usage'] if result['usage'] else '')
+        if answer:
+            send_group_msg(f'[CQ:at,qq={uid}] [AI] {answer}', api=WIKI_API)
+    except (RequestTimeout, RequestBusy):
+        budget.cancelled.set()
+        send_group_msg(f'[CQ:at,qq={uid}] 本次媒体处理超时或队列繁忙，请稍后再试。', api=WIKI_API)
+    except Exception as exc:
+        print(f'[bridge-media] processing failed: {type(exc).__name__}', flush=True)
+        send_group_msg(f'[CQ:at,qq={uid}] 本次媒体暂不可用。', api=WIKI_API)
+
+
+def _knowledge_reply_thread(event, raw, uid, privileged):
+    budget = Budget(45)
+    fingerprints = ()
+    has_media = bool(media_segments(event, ('record', 'audio', 'video', 'reply', 'forward')))
+    clean = re.sub(r'\[CQ:[^\]]*\]', '', raw).strip()
+    wants_media = bool(re.match(r'^[!！]\s*知识库\s*(?:记住|查询)', clean))
+    if wants_media and has_media and (privileged or '查询' in clean):
+        try:
+            fingerprints = bounded_call(lambda: media_fingerprints(event, WIKI_API), budget=budget, seconds=45)
+        except Exception:
+            pass
+    reply = _sanae_ai.knowledge_command(raw, privileged, fingerprints)
+    if reply:
+        if wants_media and has_media and not fingerprints:
+            reply += '\n媒体指纹未取得；本次仅按文本处理。'
+        send_group_msg(reply, api=WIKI_API)
+
 
 
 def _chat_relay_enabled():
@@ -585,7 +720,7 @@ def _chat_relay_enabled():
 
 
 def _set_chat_relay(enabled, uid):
-    os.makedirs(_os.path.dirname(CHAT_RELAY_STATE), exist_ok=True)
+    _os.makedirs(_os.path.dirname(CHAT_RELAY_STATE), exist_ok=True)
     with _CHAT_RELAY_LOCK:
         temp = CHAT_RELAY_STATE + '.tmp'
         with open(temp, 'w', encoding='utf-8') as stream:
@@ -718,32 +853,104 @@ def _qq_capability_thread(event, action, args, privileged):
         send_group_msg(f'QQ 操作暂不可用：{action}（{type(exc).__name__}）。', api=WIKI_API)
 
 
+
+def _send_ai_text(text, group_id):
+    """Show the brief directly and fold the optional complete timeline."""
+    detail_marker = '\n\n' + _sanae_ai.chat_summary.DETAIL_HEADER
+    if (_sanae_ai.chat_summary.BRIEF_HEADER in text and detail_marker in text):
+        overview, detail = text.split(detail_marker, 1)
+        if not send_group_msg(overview + '\n完整时间线见下方展开。', api=WIKI_API):
+            return False
+        return _send_folded_ai_text(_sanae_ai.chat_summary.DETAIL_HEADER + detail, group_id)
+    if len(text) <= 3500:
+        return send_group_msg(text, api=WIKI_API)
+    return _send_folded_ai_text(text, group_id)
+
+
+def _send_folded_ai_text(text, group_id):
+    """One folded message; uncertain delivery never triggers automatic replay."""
+    # Text segments prevent model-produced CQ markup becoming executable media.
+    mention = re.match(r'^\[CQ:at,qq=(\d+)\]\s*', text)
+    if mention:
+        text = text[mention.end():]
+    pages = [text[i:i+3000] for i in range(0, len(text), 3000)]
+    payload = {'group_id': int(group_id), 'source': '早苗 · 长文回答',
+               'summary': '分析与总结，点击展开',
+               'messages': [{'type': 'node', 'data': {'name': '早苗', 'uin': WIKI_BOT_QQ,
+                    'content': [{'type': 'text', 'data': {'text': page}}]}} for page in pages]}
+    if mention:
+        payload['messages'][0]['data']['content'].insert(0, {'type':'at','data':{'qq':mention[1]}})
+    try:
+        req = urllib.request.Request(WIKI_API.rstrip('/')+'/send_group_forward_msg',
+            data=json_bytes(payload), headers={'Content-Type': JSON_CONTENT_TYPE}, method='POST')
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result = json.loads(utf8_text(response.read(1024*1024)))
+        return onebot_success(result)
+    except Exception as exc:
+        # Receipt may be lost after delivery: never replay the answer on timeout.
+        print('[sanae] long answer receipt unavailable: '+type(exc).__name__, flush=True)
+        return False
+
+
+def _send_inventory_reply(reply, group_id):
+    """One folded message, or a single navigable page on unsupported OneBot builds."""
+    pages = reply.pages
+    if len(pages) <= 100 and sum(map(len, pages)) <= 200000:
+        nodes = [{'type': 'node', 'data': {'name': '早苗', 'uin': WIKI_BOT_QQ,
+                 'content': [{'type': 'text', 'data': {'text': page}}]}} for page in pages]
+        payload = {'group_id': int(group_id), 'messages': nodes,
+                   'source': '服务器模组清单', 'summary': '完整分类清单，点击展开'}
+        try:
+            req = urllib.request.Request(WIKI_API.rstrip('/') + '/send_group_forward_msg',
+                data=json_bytes(payload), headers={'Content-Type': JSON_CONTENT_TYPE}, method='POST')
+            with urllib.request.urlopen(req, timeout=15) as response:
+                body = json.loads(response.read(1024 * 1024).decode('utf-8'))
+            if onebot_success(body):
+                return True
+        except Exception as exc:
+            print(f'[ops-query] folded list unavailable: {type(exc).__name__}', flush=True)
+    text = pages[0] + '\n合并转发暂不可用，完整清单共 %d 页；发送 %s 2 等页码继续查看。' % (len(pages), reply.page_command)
+    return send_group_msg(text, api=WIKI_API)
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
+    timeout = 5.0
     def _read_body(self, max_bytes=2 * 1024 * 1024):
         """支持 Content-Length 和 chunked 两种编码。"""
         if self.headers.get('Transfer-Encoding', '').lower() == 'chunked':
             body = b''
             while True:
-                line = self.rfile.readline().strip()
-                if not line:
-                    break
+                line = self.rfile.readline(4097)
+                if not line or len(line) > 4096:
+                    raise ValueError('invalid chunk header')
                 try:
-                    size = int(line, 16)
+                    size = int(line.strip().split(b';', 1)[0], 16)
                 except ValueError:
-                    break
+                    raise ValueError('invalid chunk header') from None
+                if size < 0:
+                    raise ValueError('negative chunk size')
                 if size == 0:
-                    while self.rfile.readline().strip():
-                        pass
+                    while True:
+                        trailer = self.rfile.readline(4097)
+                        if not trailer or len(trailer) > 4096:
+                            raise ValueError('invalid chunk trailer')
+                        if trailer in (b'\r\n', b'\n'):
+                            break
                     break
                 if len(body) + size > max_bytes:
                     raise ValueError('request body too large')
-                body += self.rfile.read(size)
-                self.rfile.readline()
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b'\r\n':
+                    raise ValueError('incomplete chunk')
+                body += chunk
             return body
         length = int(self.headers.get('Content-Length', 0))
         if length < 0 or length > max_bytes:
             raise ValueError('request body too large')
-        return self.rfile.read(length) if length else b''
+        body = self.rfile.read(length) if length else b''
+        if len(body) != length:
+            raise ValueError('incomplete body')
+        return body
 
     def _authorized(self):
         if CALLBACK_SOURCE_IPS and self.client_address[0] not in CALLBACK_SOURCE_IPS:
@@ -764,8 +971,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         try:
             event = json.loads(utf8_text(body))
-        except Exception:
-            event = {}
+            if not isinstance(event, dict):
+                raise ValueError('event must be an object')
+        except (ValueError, UnicodeError):
+            self._respond(400, '{"status":"error","retcode":400}')
+            return
+        result = self.server.inbox.submit(event, lambda: self._process_event(event))
+        if result == 'full':
+            self._respond(503, '{"status":"error","retcode":503}')
+        else:
+            self._respond(200, '{"status":"ok"}')
+
+    def _process_event(self, event):
         print('[recv] post={} type={} group={}'.format(
             event.get('post_type', ''), event.get('message_type', ''),
             event.get('group_id', '')), flush=True)
@@ -774,8 +991,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if event.get('post_type') == 'message' and event.get('message_type') == 'private':
             uid = str(event.get('user_id', ''))
             if uid != str(event.get('self_id', '')):
-                threading.Thread(target=self._forward_private, args=(event,), daemon=True).start()
-            self._respond(200, '{"status":"ok"}')
+                _start_worker(self._forward_private, args=(event,))
             return
 
         # 群消息
@@ -800,7 +1016,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         not (direct_name_candidate or at_candidate or
                              pending_operation_candidate or natural_operation_candidate or
                              fun_mute_reason)):
-                    self._respond(200, '{"status":"ok"}')
                     return
 
                 # TPS/在线查询必须独立于 AI、黑话、记忆和贴纸状态。
@@ -812,11 +1027,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         print(f'[rcon] 读取操作目标失败: {type(exc).__name__}', flush=True)
                         target = None
-                    threading.Thread(target=self._rcon_query_and_reply,
-                                     args=(qk, target), daemon=True).start()
+                    _start_worker(self._rcon_query_and_reply, args=(qk, target))
                     print(f"[rcon] 查询: user={uid} type={qk} target="
                           f"{target['id'] if target else 'all'}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
 
                 # Long-term archive stores sanitized group activity; aggregate
@@ -836,9 +1049,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # member in one configured group.  Consume the message here so
                 # it cannot also wake the model or trigger stickers.
                 if fun_mute_reason:
-                    threading.Thread(target=_fun_mute_thread,
-                                     args=(event, fun_mute_reason), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(_fun_mute_thread, args=(event, fun_mute_reason))
                     return
 
                 # 只记录本群语料；黑话必须由管理员显式确认后才会注入 AI。
@@ -850,91 +1061,71 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     print(f'[slang] state write/read failed: {type(exc).__name__}', flush=True)
                     slang_reply = None
                 if slang_reply:
-                    threading.Thread(target=lambda t=slang_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(lambda t=slang_reply: send_group_msg(t, api=WIKI_API))
                     return
 
                 feedback_reply = FEEDBACK_STORE.command(raw, uid, privileged=privileged)
                 if feedback_reply:
-                    threading.Thread(target=lambda t=feedback_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(lambda t=feedback_reply: send_group_msg(t, api=WIKI_API))
                     return
 
                 sticker_reply = STICKER_CATALOG.command(raw, privileged=privileged)
                 if sticker_reply:
-                    threading.Thread(target=lambda t=sticker_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(lambda t=sticker_reply: send_group_msg(t, api=WIKI_API))
                     return
 
                 qq_capability = _qq_capability_command(raw)
                 if qq_capability:
                     action, args = qq_capability
-                    threading.Thread(target=_qq_capability_thread,
-                                     args=(event, action, args, privileged), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(_qq_capability_thread, args=(event, action, args, privileged))
                     return
 
                 # 操作目标只约束查询和管理；普通群文本始终 fan-out。
                 selection_reply = _selection_reply(raw, gid, uid)
                 if selection_reply:
                     send_group_msg(selection_reply, api=WIKI_API)
-                    self._respond(200, '{"status":"ok"}')
                     return
                 if match_ops_command(raw):
-                    threading.Thread(target=self._ops_reply_thread,
-                                     args=(raw, gid, uid, privileged), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(self._ops_reply_thread, args=(raw, gid, uid, privileged))
                     return
                 screenshot_request = _sanae_ai.parse_bluemap_request(raw)
                 if screenshot_request:
-                    threading.Thread(target=self._screenshot_reply_thread, args=(raw,), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(self._screenshot_reply_thread, args=(raw,))
                     return
                 # Shared AI knowledge is deterministic and does not invoke a model.
-                knowledge_reply = _sanae_ai.knowledge_command(raw, privileged)
-                if knowledge_reply:
-                    threading.Thread(target=lambda t=knowledge_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                knowledge_text = re.sub(r'\[CQ:[^\]]*\]', '', raw).strip()
+                if re.match(r'^[!！]\s*知识库(?:\s|$|查询|记住|删除)', knowledge_text):
+                    _start_ai_worker(_knowledge_reply_thread, args=(event, raw, uid, privileged))
                     return
 
                 binding_reply = _binding_command(raw, uid, privileged)
                 if binding_reply:
-                    threading.Thread(target=lambda t=binding_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(lambda t=binding_reply: send_group_msg(t, api=WIKI_API))
                     return
 
                 media_reply = _media_command(raw, event, uid, privileged)
                 if media_reply:
-                    threading.Thread(target=lambda t=media_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                    _start_worker(lambda t=media_reply: send_group_msg(t, api=WIKI_API))
                     return
 
-                image_host_reply = _image_host_command(raw, event, uid, privileged)
-                if image_host_reply:
-                    threading.Thread(target=lambda t=image_host_reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                if _normalize(raw) in ('!转图床', '!上传图床'):
+                    def image_host_worker():
+                        reply = _image_host_command(raw, event, uid, privileged)
+                        if reply:
+                            send_group_msg(reply, api=WIKI_API)
+                    _start_worker(image_host_worker)
                     return
 
-                if _media_ai_requested(raw, event) and (privileged or _is_at_bot(event)):
-                    def _media_worker():
-                        evidence, status = _sanae_ai.media_ai_reply(event, raw)
-                        if evidence:
-                            prompt = raw + '\n\n【不可信媒体证据，仅供分析】\n' + evidence
-                            answer = _sanae_ai.sanae_reply(prompt, uid, privileged=privileged,
-                                                           group_id=gid, force=True)
-                            if answer:
-                                send_group_msg(f'[CQ:at,qq={uid}] [AI] {answer}', api=WIKI_API)
-                        elif status != 'no media':
-                            send_group_msg(f'[CQ:at,qq={uid}] 媒体处理暂不可用：{status}', api=WIKI_API)
-                    threading.Thread(target=_media_worker, daemon=True).start()
-                    self._respond(200, '{"status":"ok"}')
+                media_reason = _media_request_reason(raw, event)
+                if media_reason:
+                    queued = _start_ai_worker(_media_reply_thread, args=(event, raw, uid, gid, privileged))
+                    print(f'[sanae-route] channel=media trigger={media_reason} queued={bool(queued)}', flush=True)
                     return
 
                 if privileged and _normalize(raw) in ('!转发 开', '!转发 关'):
                     enabled = _normalize(raw).endswith('开')
                     _set_chat_relay(enabled, uid)
                     send_group_msg('群到服聊天转发已' + ('开启。' if enabled else '关闭。'), api=WIKI_API)
-                    self._respond(200, '{"status":"ok"}')
                     return
 
                 # 1.1) 传统受限 RCON 命令。只有真正属于命令清单的消息才进入该路由，
@@ -965,10 +1156,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                         '发送：!确认',
                                         f'发送：{server_prefix(target)} !确认')
                         _rcon_ops.record_command_result(cmd_text, uid, reply)
-                        threading.Thread(target=lambda t=reply: send_group_msg(t, api=WIKI_API), daemon=True).start()
+                        _start_worker(lambda t=reply: send_group_msg(t, api=WIKI_API))
                         print(f"[rcon] 反控命令: user={uid} cmd={cmd_text[:40]} "
                               f"target={target['id'] if target else 'none'} privileged={privileged}", flush=True)
-                        self._respond(200, '{"status":"ok"}')
                         return
 
                 # 1.2) !问 <问题> → 早苗 AI（仅群主/管理员，对齐工具包）
@@ -977,33 +1167,28 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     priv = (str(uid) in OWNERS or str(uid) in ADMINS)
                     if not priv:
                         send_group_msg('[CQ:at,qq={}] AI 问答仅群主/管理员可用，群友可以 @我 聊天哦~'.format(uid), api=WIKI_API)
-                        self._respond(200, '{"status":"ok"}')
                         return
-                    threading.Thread(target=self._sanae_reply_thread, args=(event, True), daemon=True).start()
+                    _queue_sanae_reply(self._sanae_reply_thread, event, True)
                     print(f"[sanae] !问: user={uid}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
 
                 # 2) MC 百科查询（!wiki/!百科）
                 kw = _match_wiki(raw)
                 if kw:
-                    threading.Thread(target=self._wiki_query_and_reply, args=(kw,), daemon=True).start()
+                    _start_worker(self._wiki_query_and_reply, args=(kw,))
                     print(f"[wiki] 查询: user={uid} kw={kw}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
 
                 # 3) 模组查询（!mod/!模组 → Modrinth；!cf → CurseForge 官方）
                 mk = _match_mod(raw)
                 if mk:
-                    threading.Thread(target=self._mod_query_and_reply, args=(mk, 'modrinth'), daemon=True).start()
+                    _start_worker(self._mod_query_and_reply, args=(mk, 'modrinth'))
                     print(f"[mod] 查询: user={uid} kw={mk}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
                 ck = _match_cf(raw)
                 if ck:
-                    threading.Thread(target=self._mod_query_and_reply, args=(ck, 'cf'), daemon=True).start()
+                    _start_worker(self._mod_query_and_reply, args=(ck, 'cf'))
                     print(f"[mod] CF查询: user={uid} kw={ck}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
 
                 # 4) @早苗/自然点名 → 独立 AI 模块（不走 agent）
@@ -1011,45 +1196,40 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # 仅限消息开头点名，避免普通聊天里提到角色名就抢答。
                 direct_name_call = direct_name_candidate
                 if pending_operation_candidate:
-                    threading.Thread(target=self._sanae_reply_thread,
-                                     args=(event, True), daemon=True).start()
+                    _queue_sanae_reply(self._sanae_reply_thread, event, True)
                     print(f"[sanae] 待确认操作自然回复: user={uid}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
                 if natural_operation_candidate:
-                    threading.Thread(target=self._sanae_reply_thread,
-                                     args=(event, True), daemon=True).start()
+                    _queue_sanae_reply(self._sanae_reply_thread, event, True)
                     print(f"[sanae] 自然服务器操作: user={uid}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
                 if at_candidate:
-                    threading.Thread(target=self._sanae_reply_thread, args=(event,), daemon=True).start()
+                    _queue_sanae_reply(self._sanae_reply_thread, event)
                     print(f"[sanae] @早苗: user={uid}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
+                    return
+                if direct_name_call and _sanae_ai.chat_recall.is_recall(raw):
+                    _queue_sanae_reply(self._sanae_reply_thread, event, True)
                     return
                 if direct_name_call and SOCIAL_LITE_ENABLED and gid == SOCIAL_LITE_GROUP:
                     try:
                         scheduled, reason = SOCIAL_LITE.maybe_schedule(
-                            event, self._social_reply_thread,
+                            event, lambda event, context: _start_ai_worker(self._social_reply_thread, (event, context)),
                             delay_seconds=float(_os.environ.get('SOCIAL_LITE_DEBOUNCE', '2.5')))
                     except Exception as exc:
                         # 状态文件权限/短暂 I/O 故障不能让明确点名变成无响应。
                         print(f'[sanae] 点名社交调度失败: {type(exc).__name__}', flush=True)
-                        threading.Thread(
-                            target=lambda: send_group_msg(
+                        _start_worker(lambda: send_group_msg(
                                 f'[CQ:at,qq={uid}] 我在，刚才没接稳。把要接的话再发一次，我马上接上。',
-                                api=WIKI_API), daemon=True).start()
-                        self._respond(200, '{"status":"ok"}')
+                                api=WIKI_API))
                         return
                     print(f"[sanae] 点名早苗转社交上下文: user={uid} scheduled={scheduled} reason={reason}", flush=True)
-                    self._respond(200, '{"status":"ok"}')
                     return
 
-                # Social Lite 只在配置群启用；本地门控后再单轮唤醒模型。
+                # Social Lite 只在现有 1001 群启用；本地门控后再单轮唤醒模型。
                 if SOCIAL_LITE_ENABLED and gid == SOCIAL_LITE_GROUP:
                     try:
                         scheduled, reason = SOCIAL_LITE.maybe_schedule(
-                            event, self._social_reply_thread,
+                            event, lambda event, context: _start_ai_worker(self._social_reply_thread, (event, context)),
                             delay_seconds=float(_os.environ.get('SOCIAL_LITE_DEBOUNCE', '2.5')))
                         if scheduled:
                             print(f'[social-lite] scheduled group={gid} reason={reason}', flush=True)
@@ -1058,13 +1238,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
                 # 5) 群→服 G2S 全量转发（非 bot 消息都 say 进游戏）
                 if RELAY_G2S_ENABLED and _chat_relay_enabled():
-                    threading.Thread(target=self._relay_g2s, args=(event,), daemon=True).start()
+                    _start_worker(self._relay_g2s, args=(event,))
 
-            self._respond(200, '{"status":"ok"}')
             return
 
         # 其他事件（通知等）：静默
-        self._respond(200, '{"status":"ok"}')
 
     def _forward_private(self, event):
         """私聊消息转发给狗蛋。"""
@@ -1076,9 +1254,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         msg = f"[私聊] {nickname}({uid}): {text}"
         for owner in OWNERS:
             if send_private_msg(owner, msg):
-                print(f"[private→狗蛋] user={uid} msg={raw[:50]}", flush=True)
+                print('[private-forward] delivered=True', flush=True)
             else:
-                print(f"[private→狗蛋失败] user={uid} msg={raw[:50]}", flush=True)
+                print('[private-forward] delivered=False', flush=True)
 
     def _wiki_query_and_reply(self, keyword):
         """!wiki: MC百科 primary result enriched by existing mod_lookup sources."""
@@ -1105,6 +1283,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _sanae_reply_thread(self, event, force=False):
         """@早苗 / !问 独立回复：正则匹配 → DeepSeek API（带工具）→ 早苗 API 发回（完全不走 agent）。"""
+        trigger = _ai_reply_trigger(event)
+        if not trigger:
+            print('[sanae-route] channel=ai blocked=no-invocation message_id={} user={}'.format(
+                event.get('message_id', ''), event.get('user_id', '')), flush=True)
+            return
         try:
             raw = str(event.get('raw_message', ''))
             uid = event.get('user_id')
@@ -1119,6 +1302,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     print(f'[sanae] interim 失败: {e}', flush=True)
 
             selected_server, raw, target_unambiguous = _ai_operation_target(raw, gid, uid)
+            context_reference = ''
             # 运维工具的意图识别必须基于干净的当前消息。把长期记忆、黑话或
             # 风格策略拼进来，会让其中的“解释/说明”等词误关掉 run_rcon。
             if gid == SOCIAL_LITE_GROUP and not _is_ai_operation_turn(raw, privileged):
@@ -1135,23 +1319,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 sticker_rows = STICKER_CATALOG.recommend(raw, limit=3)
                 if sticker_rows:
                     extras.append('〖可选贴纸语义〗' + '、'.join(dict.fromkeys(x['mood'] for x in sticker_rows)) + '（仅供内部选择）')
-                raw += '\n\n' + '\n'.join(extras)
+                context_reference = '\n'.join(extras)
             reply = _sanae_ai.sanae_reply(raw, uid, nick, privileged=privileged,
                                           group_id=gid, send_cb=_interim, force=force,
                                           selected_server=selected_server,
-                                          explicit_server=target_unambiguous)
+                                          explicit_server=target_unambiguous,
+                                          context_reference=context_reference)
             if reply:
                 msg = f'[CQ:at,qq={uid}] [AI] {reply}'
                 recommended = STICKER_CATALOG.recommend(reply, limit=3)
-                if SOCIAL_STICKER_MODE == 'auto' and recommended and _sticker_cooldown_ok(gid):
+                if (len(msg) <= 3500 and _sanae_ai.chat_summary.BRIEF_HEADER not in msg and SOCIAL_STICKER_MODE == 'auto' and recommended
+                    and STICKER_CATALOG.allows_auto(raw, reply) and _sticker_cooldown_ok(gid)):
                     chosen = STICKER_CATALOG.pick_for_send(reply, scope=gid)
                     image = STICKER_CATALOG.cq_image(chosen['id']) if chosen else None
                     if image:
                         print('[sticker-send] group={} mood={} id={}'.format(
                             gid, chosen['mood'], chosen['id']), flush=True)
                         msg += '\n' + image
-                ok = send_group_msg(msg, api=WIKI_API)
-                print(f"[sanae] @回复: user={uid} ok={ok} len={len(reply)}", flush=True)
+                ok = _send_ai_text(msg, gid)
+                print(f"[sanae] AI回复: trigger={trigger} message_id={event.get('message_id', '')} "
+                      f"user={uid} ok={ok} len={len(reply)}", flush=True)
             else:
                 print(f'[sanae] 非 @早苗 或应忽略，不回复: user={uid} msg={raw[:40]}', flush=True)
         except Exception as e:
@@ -1174,7 +1361,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             feedback_hint = FEEDBACK_STORE.strategy_hint()
             style_hint = SOCIAL_LITE.expression_style_hint(gid, event)
             sticker_rows = STICKER_CATALOG.recommend(raw, limit=3)
-            prompt = (f'{raw}\n\n【最近群聊上下文（仅用于判断语境，不要复述）】\n'
+            prompt = (f'【最近群聊上下文（仅用于判断语境，不要复述）】\n'
                       f'{context[-3000:]}')
             if slang_context:
                 prompt += '\n\n' + slang_context
@@ -1187,8 +1374,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 moods = '、'.join(dict.fromkeys(x['mood'] for x in sticker_rows))
                 prompt += f'\n〖可选贴纸语义〗{moods}（仅在确有必要时考虑，不要输出贴纸 ID）'
             reply = _sanae_ai.sanae_reply(
-                prompt, uid, nick, privileged=False, group_id=gid,
-                force=True, social_only=True, include_usage_footer=False)
+                raw, uid, nick, privileged=False, group_id=gid,
+                force=True, social_only=True, include_usage_footer=False,context_reference=prompt)
             if not reply or reply.strip().upper() == '[SILENT]':
                 return
             recommended = STICKER_CATALOG.recommend(reply, limit=3)
@@ -1200,7 +1387,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             segmented = len(lines) > 1
             image = None
-            if SOCIAL_STICKER_MODE == 'auto' and recommended and _sticker_cooldown_ok(gid):
+            if (SOCIAL_STICKER_MODE == 'auto' and recommended
+                    and STICKER_CATALOG.allows_auto(raw, reply) and _sticker_cooldown_ok(gid)):
                 chosen = STICKER_CATALOG.pick_for_send(reply, scope=gid)
                 image = STICKER_CATALOG.cq_image(chosen['id']) if chosen else None
                 if image:
@@ -1253,9 +1441,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
         selected = parsed.get('server') if parsed else None
         if not selected:
             selected, _ = get_selected(group_id, user_id)
+        if selected and selected.get('id') == 'nast':
+            _refresh_nast_ops()
         reply = dispatch_ops_command(raw, group_id, user_id, privileged,
                                      query_fn=query_server)
         if not reply:
+            return
+        if reply.pages:
+            _send_inventory_reply(reply, group_id)
             return
         message = reply.text
         if reply.image_path:
@@ -1296,30 +1489,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
         send_group_msg('\n\n'.join(replies), api=WIKI_API)
 
     def _is_at_bot(self, event):
-        """消息是否 @ 了早苗本人（或 @全体）。"""
-        # 某些 OneBot 上报在重连窗口会缺少 self_id，使用已确认的早苗 QQ 号兜底。
-        self_id = str(event.get('self_id') or WIKI_BOT_QQ)
-        msg = event.get('message')
-        if isinstance(msg, list):
-            for seg in msg:
-                if isinstance(seg, dict) and seg.get('type') == 'at':
-                    qq = str(seg.get('data', {}).get('qq', ''))
-                    if qq == self_id or qq == 'all':
-                        return True
-        raw = str(event.get('raw_message', ''))
-        if self_id and (f'[CQ:at,qq={self_id}]' in raw or f'[CQ:at,qq={self_id},' in raw):
-            return True
-        if '[CQ:at,qq=all]' in raw:
-            return True
-        return False
+        """消息是否明确 @ 了早苗本人。"""
+        return _event_mentions_sanae(event)
 
     def _is_direct_name_call(self, event):
         """识别不带 CQ at 的自然点名，例如“早苗，看看这个”。"""
-        raw = str(event.get('raw_message', '') or '')
-        if not raw or self._is_at_bot(event):
-            return False
-        text = re.sub(r'\[CQ:[^\]]*\]', '', raw, flags=re.I).strip()
-        return bool(re.match(r'^早苗(?:\s|[，,：:。！？!?、]|$)', text))
+        return _event_direct_name_call(event)
 
     def _respond(self, code, body):
         data = str(body).lstrip('\ufeff').encode('utf-8')
@@ -1336,6 +1511,8 @@ if __name__ == '__main__':
     _sanae_ai.start_pricing_refresh()
     if _os.environ.get('SANAE_ENABLE_BACKUP_WATCH', '1') == '1':
         _backup_watch.start()
+    if _os.environ.get('SANAE_ENABLE_NAST_SYNC', '1') == '1':
+        threading.Thread(target=_nast_ops_sync_loop, name='nast-ops-sync', daemon=True).start()
     if _os.environ.get('SANAE_ENABLE_LEGACY_MONITOR', '0') == '1':
         # Keep the Windows production deployment single-process: the existing
         # monitor only emits join/advancement/crash/ops events and deliberately
@@ -1344,4 +1521,4 @@ if __name__ == '__main__':
         threading.Thread(target=_legacy_monitor.main,
                          name='legacy-monitor', daemon=True).start()
     print(f"桥接服务启动: 监听 0.0.0.0:{BRIDGE_PORT} → 早苗独立模块体系（!wiki/!mod/RCON/@早苗/G2S/私聊），完全不走 agent", flush=True)
-    HTTPServer(('0.0.0.0', BRIDGE_PORT), BridgeHandler).serve_forever()
+    CallbackServer(('0.0.0.0', BRIDGE_PORT), BridgeHandler, source_ips=CALLBACK_SOURCE_IPS).serve_forever()

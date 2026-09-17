@@ -168,8 +168,7 @@ class SocialLite:
             return 0, "self"
         score = 0
         reasons: list[str] = []
-        at_self = re.search(rf"\[CQ:at,qq={re.escape(self.self_id)}(?:,[^\]]*)?\]", raw, re.I)
-        if at_self or "早苗" in text:
+        if re.search(r"\[CQ:at,qq=" + re.escape(self.self_id) + r"(?:,[^\]]*)?\]", raw, re.I) or "早苗" in text:
             score += 5; reasons.append("direct")
         reply = event.get("reply")
         if isinstance(reply, dict) and str(reply.get("user_id") or "") == self.self_id:

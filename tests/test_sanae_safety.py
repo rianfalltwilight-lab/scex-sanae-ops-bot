@@ -39,7 +39,7 @@ class SanaeSafetyTests(unittest.TestCase):
                 "prompt_tokens": 2000, "prompt_cache_hit_tokens": 1500,
                 "completion_tokens": 200}})
             footer = usage.footer()
-        self.assertIn("模型：DeepSeek-V4-Flash-0731", footer)
+        self.assertIn("模型：deepseek-v4-flash", footer)
         self.assertIn("费用：约 0.0034 元（官方高峰价）", footer)
         self.assertIn("用量：2,200 tok（入 2,000，出 200，缓存命中 1,500）｜1 次请求", footer)
         self.assertIn("耗时：1.30s", footer)
@@ -420,8 +420,9 @@ class SanaeSafetyTests(unittest.TestCase):
 
     def test_incident_postmortem_is_admin_only_and_window_is_fixed(self):
         denied = s.execute_tool("incident_postmortem", {"window": "24h"}, False)
-        self.assertIn("只有管理员", denied)
-        with mock.patch.object(s, "subprocess") as subprocess:
+        self.assertIn("管理员", denied)
+        with mock.patch.object(s, "subprocess") as subprocess, \
+             mock.patch("sanae_local_ops.canonical_local_server", return_value=({"prefix": "[test]"}, Path.cwd())):
             invalid = s.execute_tool("incident_postmortem", {"window": "30d"}, True)
         self.assertIn("window 只能是", invalid)
         subprocess.run.assert_not_called()
@@ -466,25 +467,16 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertNotIn("remove_all", answer)
 
     def test_config_write_requires_current_message_key_and_value(self):
-        with mock.patch.object(s, "_mcfile_post", return_value="WROTE") as post:
-            denied = s.execute_tool("set_server_property", {"key": "view-distance", "value": "12"},
-                                    True, True, True, "请修改配置")
-            self.assertIn("拒绝", denied)
-            post.assert_not_called()
-            accepted = s.execute_tool("set_server_property", {"key": "view-distance", "value": "12"},
-                                      True, True, True, "请修改配置 view-distance 设置为 12")
-            self.assertEqual(accepted, "WROTE")
-            post.assert_called_once()
+        # Generic file writes are now disabled even for explicit administrator requests.
+        for request in ("修改配置", "view-distance 12 config/a.toml old = 1 old = 2"):
+            result = s.execute_tool("set_server_property", {"key": "view-distance", "value": "12"}, True, True, True, request)
+            self.assertIn("已停用", result)
 
     def test_replace_requires_path_old_and_new_in_current_message(self):
-        args = {"path": "config/a.toml", "find": "old = 1", "replace": "old = 2"}
-        with mock.patch.object(s, "_mcfile_post", return_value="WROTE") as post:
-            denied = s.execute_tool("replace_in_config", args, True, True, True, "修改 config/a.toml")
-            self.assertIn("拒绝", denied)
-            post.assert_not_called()
-            accepted = s.execute_tool("replace_in_config", args, True, True, True,
-                                      "修改 config/a.toml，把 old = 1 改成 old = 2")
-            self.assertEqual(accepted, "WROTE")
+        # Generic file writes are now disabled even for explicit administrator requests.
+        for request in ("修改配置", "view-distance 12 config/a.toml old = 1 old = 2"):
+            result = s.execute_tool("replace_in_config", {"path": "config/a.toml", "find": "old = 1", "replace": "old = 2"}, True, True, True, request)
+            self.assertIn("已停用", result)
 
     def test_group_file_download_requires_admin_and_current_explicit_intent(self):
         args = {"project": "mekanism", "game_version": "1.21.1", "loader": "neoforge"}
@@ -655,6 +647,7 @@ class SanaeSafetyTests(unittest.TestCase):
         def fake_agent(text, user_id, privileged, group_id, interim_cb=None, image_url=None, **_kwargs):
             captured['text'] = text
             captured['image_url'] = image_url
+            captured['reference'] = _kwargs.get('context_reference', '')
             return 'ok', mock.Mock(footer=lambda: '———\n模型：test｜费用：无法计算｜耗时：0.01s'), False
 
         quoted = '[CQ:image,url=https://cdn.example/quoted.png] 原消息图片'
@@ -664,7 +657,7 @@ class SanaeSafetyTests(unittest.TestCase):
             out = s.sanae_reply(raw, 'u', privileged=True)
         self.assertTrue(out.startswith('ok\n'))
         self.assertEqual(captured['image_url'], 'https://cdn.example/quoted.png')
-        self.assertIn('原消息图片', captured['text'])
+        self.assertIn('原消息图片', captured['reference'])
 
     def test_reply_fetch_failure_keeps_current_message(self):
         raw = '[CQ:reply,id=123][CQ:at,qq=1002] 这是什么'

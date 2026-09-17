@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RCON 反控命令模块（基于 minecraft-server-ops-kit 的运维能力改造）
+RCON 反控命令模块（2026-08-16 按 upstream QQConsoleBridge 功能实现）
 - 命令集对齐工具包 QQConsoleBridge：help/list/day/rules/version/uptime/ip/roll/运势/id（全体）
   + tps/backup/save/seed/weather/say/stop/restart/cmd（群主/管理员）
 - RCON 走 rcon_client（NeoForge 自动适配 neoforge tps）
@@ -25,8 +25,8 @@ from ops_contract import append_jsonl, command_result
 from server_registry import active_server, query_server, server_context
 from command_catalog import normalize_console_command
 
-# 服务器根目录和公开地址均由部署配置提供。
-SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", str(Path(__file__).with_name("server"))))
+# 服务器根目录（Mac 侧）
+SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", "/Users/goudanli/Downloads/NAST Server1.9.9"))
 ADDR = os.environ.get("MC_SERVER_ADDR", "example.invalid:25565")
 
 # 命令权限：普通 vs 管理员
@@ -79,10 +79,12 @@ def record_command_result(command, uid, reply):
     """Persist a machine-readable result alongside the existing QQ text."""
     text = str(reply or "")
     failed = bool(re.search(r"(失败|不可用|不在线|拒绝|已过期|不存在)", text, re.I))
+    server = active_server() or {}
     append_jsonl(RESULT_PATH, command_result(
         command, state="failed" if failed else "success",
         output="" if failed else text, error=text if failed else None,
-        actor=str(uid), started_at=None, finished_at=time.time()))
+        actor=str(uid), started_at=None, finished_at=time.time(),
+        server=str(server.get("id") or "unknown")))
 
 
 def _run(cmd):
@@ -251,18 +253,65 @@ def _gamerule(rule):
 
 
 def cmd_help(privileged):
-    p = "!"
-    common = (f"【服务器命令】\n"
-              f"{p}list 在线列表\n{p}day 查看游戏内天数时间\n{p}rules 服务器规则\n"
-              f"{p}version 服务端版本\n{p}uptime 开服运行时长\n{p}ip 服务器地址\n"
-              f"{p}roll <面数> 掷骰子\n{p}运势 今日MC运势\n{p}id 查看自己的QQ号")
+    from server_registry import server_hint
+    from media_pipeline import stage_config
+    media_status = '；'.join(label + '：' + ('已启用' if stage_config(kind)[0] == 'ok' else stage_config(kind)[0])
+                            for kind, label in [('ASR', '转写'), ('Omni', '声音理解'), ('视频', '视频理解')])
+    common = (
+        '【早苗帮助】!help / !帮助\n'
+        f'可用服务器：{server_hint()}\n'
+        '!服 查看当前目标；!服 名称 选择；!服 自动 清除选择\n'
+        '服务器查询先选服，或在命令前加对应服务器标签。\n'
+        '\n◆ 模组与资料\n'
+        '!mods / !模组 / !mod清单 已安装模组完整分类清单\n'
+        '包含模组 ID、依赖及反向依赖；长清单折叠，无法折叠时用 !mods 2 等页码翻页。\n'
+        '!mod 关键词 搜 Modrinth；!cf 关键词 搜 CurseForge\n'
+        '!wiki 关键词 / !百科 关键词 查百科\n'
+        '!配方 物品名或ID 查配方索引\n'
+        '!周报 / !运行报告 查近7天统计；!周报 详情 / !体检 查统计口径与数据覆盖\n'
+        '周报每周一20:00（北京时间）自动发玩家群；包含性能、在线、启停、备份和磁盘。\n'
+        '\n◆ AI 与共享知识\n'
+        '@早苗 问题 进行问答；已保存的相关通用知识会自动用于回答。\n'
+        '可回复合并转发后 @早苗 分析一下；或 @早苗 总结最近群聊。\n'
+        '认真问答支持长文与分点；多轮20轮/2小时，聊天总结最多1000条/9.6万字符。\n'
+        '聊天总结先给240字内简短总结，完整时间线另附一条折叠消息。\n'
+        '只要短版：@早苗 简短总结；刚总结完可说“@早苗 太长了，简短点”。\n'
+        '图片/音视频另走对应媒体能力；缺失、截断和实际读取范围会注明。\n'
+        '!知识库 查看条目数；!知识库查询 关键词 查询\n'
+        '知识保存与删除仅管理员可用。\n'
+        '\n◆ 语音与视频\n'
+        '引用媒体（也支持合并转发）后发送：\n'
+        '!转写 / !语音转写 只转写文字\n'
+        '!听语音 理解说话、音乐或环境声音\n'
+        '引用视频后 @早苗 提问，分析画面及声音。\n'
+        f'当前服务：{media_status}\n'
+        '未启用或未配置的媒体服务不会调用。\n'
+        '\n◆ 服务器与趣味\n'
+        '!list 在线列表；!day 游戏天数与时间；!rules 规则\n'
+        '!version 版本；!uptime 运行状态；!ip 连接地址\n'
+        '服务器启动完成会通知玩家群，包含总耗时、Minecraft内部阶段耗时和连接地址。\n'
+        '!roll 面数 掷骰子；!运势 今日运势；!id 自己的QQ号'
+    )
     if not privileged:
         return common
-    return common + ("\n◆ 群主/管理员可用\n"
-                     f"{p}tps 服务器性能\n{p}backup 备份存档\n{p}save 立即存盘\n"
-                     f"{p}seed 查看世界种子\n{p}weather 晴/雨/雷 修改天气\n"
-                     f"{p}say 内容 发公告到游戏公屏\n{p}restart 确认后安全重启\n"
-                     f"{p}stop 查看持续停服限制\n{p}cmd 命令 确认后执行RCON命令")
+    return common + (
+        '\n\n◆ 管理员命令\n'
+        '!问 问题 AI 问答；!ai 查看模型状态\n'
+        '!知识库记住 主题 => 结论 保存通用短结论\n'
+        '!知识库删除 关键词 删除匹配知识\n'
+        '记住/查询时可引用媒体，关联媒体指纹；不保存原始音视频。\n'
+        'AI 工具任务只返回计划时会继续核对一次；认真问答和总结最多约四分钟；媒体任务约两分钟。\n'
+        '超时后已开始的操作需核实结果，不会自动重放。\n'
+        '!错误摘要 6h / !时间线 6h / !复盘 24h 查询运维记录\n'
+        '时间窗口：1h / 6h / 24h / 7d\n'
+        '!卡顿取证 后台取证，完成发玩家群；!卡顿取证 最新 查看结果；!验备份 校验已有备份\n'
+        '!tps 性能；!backup 创建备份；!backup 状态 查看进度\n'
+        '!save 存盘；!seed 种子；!weather 晴/雨/雷 改天气\n'
+        '!say 内容 发游戏公告；!restart 确认后重启\n'
+        '!stop 查看持续停服限制；!cmd 命令 申请执行控制台命令\n'
+        '!确认 验证码 确认待执行操作；!取消确认 取消\n'
+        '重启/停服须在本条命令加服务器标签；其他高危操作按确认提示执行。'
+    )
 
 
 def cmd_list():
@@ -413,18 +462,15 @@ def cmd_version():
             return "[版本] " + out.strip()[:200]
     except Exception:
         pass
-    configured = str(os.environ.get("MC_VERSION_LABEL") or "").strip()
-    if configured:
-        return configured if configured.startswith("[版本]") else "[版本] " + configured[:200]
     name = str((server or {}).get("name") or "当前服务器").strip()
     return f"[版本] {name}（详细版本未在服务器注册表登记）"
 
 
 def cmd_uptime():
-    """RCON 可达即视为在线；精确 uptime 需要读取服务端日志。"""
+    """RCON 可达即视为在线（uptime 精确值需读 Mac 日志，跨机器不可行）。"""
     try:
         _run("list")
-        return "[运行时长] 服务器当前在线（RCON 可达）。精确开服时长需查 logs/latest.log。"
+        return "[运行时长] 服务器当前在线（RCON 可达）。精确开服时长需在服务端查 logs/latest.log。"
     except Exception as e:
         return f"[运行时长] 服务器可能不在线（RCON 不可达）：{e}"
 
@@ -515,7 +561,7 @@ def _cmd_backup_status():
     if sync:
         lines.append(f"异地：{sync.get('message', sync.get('state', '未知'))}")
         if sync.get("localSize"):
-            lines.append(f"字节校验：源端 {sync.get('localSize')} / 目标端 {sync.get('remoteSize', 0)}")
+            lines.append(f"字节校验：Mac {sync.get('localSize')} / Monarch {sync.get('remoteSize', 0)}")
     return "\n".join(lines)
 
 

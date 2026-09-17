@@ -24,3 +24,5 @@ htmlcov/
 feedback-*/
 slang-*/
 social-lite-*/
+
+build/

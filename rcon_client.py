@@ -14,6 +14,8 @@ import os
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rcon-config.json')
 
+from request_runtime import remaining_timeout, check_active
+
 class RconError(Exception):
     pass
 
@@ -30,8 +32,8 @@ class RconClient:
         self._next_id = 1
 
     def _connect(self):
-        s = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        s.settimeout(self.timeout)
+        s = socket.create_connection((self.host, self.port), timeout=remaining_timeout(self.timeout))
+        s.settimeout(remaining_timeout(self.timeout))
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock = s
         self._authenticate()
@@ -52,6 +54,7 @@ class RconClient:
     def _recv_exact(self, n):
         buf = b''
         while len(buf) < n:
+            self._sock.settimeout(remaining_timeout(self.timeout))
             chunk = self._sock.recv(n - len(buf))
             if not chunk:
                 raise RconError('RCON 连接断开')
@@ -59,6 +62,8 @@ class RconClient:
         return buf
 
     def _send(self, id_, type_, body):
+        check_active()
+        self._sock.settimeout(remaining_timeout(self.timeout))
         self._sock.sendall(self._pack(id_, type_, body))
 
     def _authenticate(self):
@@ -84,7 +89,7 @@ class RconClient:
         self._send(cmd_id, 2, command)  # SERVERDATA_EXECCOMMAND
 
         deadline = self.timeout
-        self._sock.settimeout(deadline)
+        self._sock.settimeout(remaining_timeout(deadline))
         first = self._read_packet()
         if first[0] == -1:
             raise RconError('RCON 会话失效')

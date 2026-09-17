@@ -20,6 +20,9 @@ class StickerRotationTests(unittest.TestCase):
                 for index in range(4)
             ]
         }
+        (self.root / 'assets').mkdir()
+        for index in range(4):
+            (self.root / 'assets' / f'reject-{index}.jpg').write_bytes(b'fixture')
         self.path = self.root / 'stickers.json'
         self.path.write_text(json.dumps(manifest, ensure_ascii=False), encoding='utf-8')
         self.catalog = StickerCatalog(self.path)
@@ -28,10 +31,10 @@ class StickerRotationTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_same_mood_rotates_without_immediate_repeats(self):
-        picks = [self.catalog.pick_for_send('不行，拒绝', scope='group-1')['id']
+        picks = [self.catalog.pick_for_send('我拒绝', scope='group-1')['id']
                  for _ in range(4)]
         self.assertEqual(4, len(set(picks)))
-        fifth = self.catalog.pick_for_send('不行，拒绝', scope='group-1')['id']
+        fifth = self.catalog.pick_for_send('我拒绝', scope='group-1')['id']
         self.assertNotEqual(picks[-1], fifth)
 
     def test_unknown_semantics_do_not_force_a_sticker(self):

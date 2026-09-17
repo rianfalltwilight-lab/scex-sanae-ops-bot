@@ -12,6 +12,8 @@
 [`i0czf/minecraft-server-ops-kit`](https://github.com/i0czf/minecraft-server-ops-kit)，
 本仓库是面向 SCEX 真实生产环境的特化与重写版本，不是上游官方发行版。
 
+最新源码同步：[2026-09-17 更新说明与验证边界](docs/UPDATE-20260917.md)。
+
 ## 它解决什么问题
 
 传统群服机器人往往只有两种：纯命令机器人太硬，所有消息都交给大模型又耗资源、容易刷屏，
@@ -34,6 +36,7 @@
 - **拟人闲聊**：早苗角色卡、短句/分条节奏、被点名可靠回复、低概率环境回复、可选择沉默。
 - **轻量学习闭环**：黑话候选、长期主题记忆、反馈记录、聊天活动日志和有限容量状态。
 - **贴纸策略**：按开心、无语、拒绝、震惊、道歉、撒娇等语义选择素材，带冷却与单次上限；素材本身不随仓库分发。
+- **聊天回溯与总结**：从实际可读引用和聊天样本生成短总结及完整时间线，支持同范围缓存短版。
 - **媒体理解**：解析 OneBot 图片/引用消息，可选视觉模型描述；文件大小、来源与下载路径受限制。
 - **UTF-8 通路**：JSON `ensure_ascii=False`、UTF-8 字节与 BOM 兼容，避免中文经过嵌套 PowerShell 命令后乱码。
 
@@ -87,7 +90,7 @@ Gemini 失败时偷偷回落到另一个 provider。
 
 ```powershell
 $env:SCE_BOT_TEST_MODE = '1'
-python -m unittest discover -s tests -v
+python scripts/test-offline.py
 ```
 
 ## 目录说明

@@ -27,3 +27,9 @@ $env:GEMINI_THINKING_LEVEL = 'low'
 # GEMINI_API_KEY 不要写入此文件；生产环境请存入私有 secrets.json 的 gemini_api_key。
 $env:ZHIPU_VISION_MODEL = 'glm-4.5v-flash'
 $env:RELAY_G2S = '1'
+
+# Optional local media tools; leave unset when unused.
+# $env:LLBOT_BIN = "<LLBot bin directory>"
+# $env:SANAE_FFMPEG = "<ffmpeg executable>"
+# $env:SANAE_NODE = "<Node executable>"
+# $env:SANAE_SILK_MODULE = "<silk-wasm entry module>"

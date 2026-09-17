@@ -36,7 +36,7 @@ def normalize_log_fingerprint(raw: str) -> str:
 
 
 def event(event_type: str, payload: dict[str, Any], *, source: str = "minecraft_log",
-          server: str = "minecraft-server", raw: str = "", occurred_at: float | None = None) -> dict[str, Any]:
+          server: str = "unknown", raw: str = "", occurred_at: float | None = None) -> dict[str, Any]:
     """Create a stable, serializable event envelope."""
     occurred_at = time.time() if occurred_at is None else occurred_at
     basis = json.dumps({"type": event_type, "payload": payload, "raw": raw},
@@ -55,7 +55,7 @@ def event(event_type: str, payload: dict[str, Any], *, source: str = "minecraft_
 def command_result(command: str, *, state: str, output: str = "", error: str | None = None,
                    request_id: str | None = None, actor: str | None = None,
                    started_at: float | None = None, finished_at: float | None = None,
-                   server: str = "minecraft-server") -> dict[str, Any]:
+                   server: str = "unknown") -> dict[str, Any]:
     """Create a command result envelope without changing the human renderer."""
     return {
         "request_id": request_id or "req-" + uuid.uuid4().hex[:24],
@@ -89,8 +89,9 @@ def render_command_result(result: dict[str, Any], title: str = "控制台") -> s
     return f"[{title}] 执行失败：{result.get('error') or '未知错误'}"
 
 
-def read_incremental_lines(path: str | Path, state: dict[str, Any]) -> tuple[list[str], dict[str, Any], bool]:
-    """Read only complete UTF-8 lines and retain an unterminated tail."""
+def read_incremental_lines(path: str | Path, state: dict[str, Any], *,
+                           max_bytes: int = 1024 * 1024) -> tuple[list[str], dict[str, Any], bool]:
+    """Read a bounded batch of complete UTF-8 lines and retain a partial tail."""
     path = Path(path)
     if not path.exists():
         return [], state, False
@@ -106,22 +107,32 @@ def read_incremental_lines(path: str | Path, state: dict[str, Any]) -> tuple[lis
             current_head = hashlib.sha256(probe.read(min(128, offset))).hexdigest()
         if current_head != state.get("head"):
             offset = 0
+    read_limit = max(4096, int(max_bytes))
     with path.open("rb") as fh:
         fh.seek(offset)
         # The committed offset points before the retained partial tail, so the
         # next read naturally includes that tail. Do not prepend it again.
-        raw = fh.read(size - offset)
+        raw = fh.read(min(size - offset, read_limit))
     if not raw:
-        return [], {"inode": inode, "offset": size, "partial": ""}, True
+        head = state.get("head")
+        if not head:
+            with path.open("rb") as probe:
+                head = hashlib.sha256(probe.read(min(128, size))).hexdigest()
+        return [], {"inode": inode, "offset": size, "partial": "", "head": head}, True
+    read_end = offset + len(raw)
     if raw.endswith(b"\n"):
         complete, partial = raw, b""
     else:
         split_at = raw.rfind(b"\n")
-        if split_at < 0:
+        if split_at < 0 and read_end < size:
+            # A single pathological record must not pin the reader forever or
+            # force it to allocate the entire backlog in one polling cycle.
+            complete, partial = raw + b" [truncated-record]\n", b""
+        elif split_at < 0:
             complete, partial = b"", raw
         else:
             complete, partial = raw[:split_at + 1], raw[split_at + 1:]
-    committed = size - len(partial)
+    committed = read_end - len(partial)
     lines = complete.decode("utf-8", errors="replace").splitlines()
     with path.open("rb") as probe:
         head = hashlib.sha256(probe.read(min(128, committed))).hexdigest()

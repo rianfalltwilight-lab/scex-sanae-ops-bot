@@ -12,35 +12,36 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backup_verify import format_backup_verification
-from mod_inventory import format_inventory
+from mod_inventory import format_inventory, format_inventory_pages
 from ops_contract import append_jsonl
 from ops_telemetry import OpsTelemetry
 from recipe_index import format_recipe, query_recipes, render_recipe_png
-from server_registry import extract_server_selector, get_selected, server_hint, server_prefix
+from server_registry import extract_server_selector, get_selected, server_prefix, server_hint
 
 
 STATE_BASE = Path(os.environ.get(
     "OPS_STATE_BASE", str(Path(__file__).with_name("state") / "ops")))
 IMAGE_WSL_DIR = Path(os.environ.get(
     "OPS_RECIPE_IMAGE_DIR", str(Path(__file__).with_name("state") / "ops-images")))
-IMAGE_WINDOWS_DIR = os.environ.get(
-    "OPS_RECIPE_IMAGE_WINDOWS_DIR", str(Path(__file__).with_name("state") / "ops-images"))
+IMAGE_WINDOWS_DIR = os.environ.get("OPS_RECIPE_IMAGE_WINDOWS_DIR", str(IMAGE_WSL_DIR))
 
 
 @dataclass
 class OpsReply:
     text: str
     image_path: str = ""
+    pages: tuple = ()
+    page_command: str = '!mods'
 
 
 _COMMANDS = (
-    ("mods", re.compile(r"^[!！](?:mods|modlist|模组清单|模组列表)\s*$", re.I)),
+    ("mods", re.compile(r"^[!！](?:mods|mod|modlist|模组|模组清单|模组列表|mod清单|mod列表)(?:\s+(\d+))?\s*$", re.I)),
     ("errors", re.compile(r"^[!！](?:错误摘要|错误指纹|errors?)(?:\s+(1h|6h|24h|7d))?\s*$", re.I)),
     ("lag", re.compile(r"^[!！](?:卡顿取证|lag)(?:\s+(.+))?\s*$", re.I)),
     ("backup", re.compile(r"^[!！](?:验备份|验证备份)(?:\s+(deep|deep\d+|\d+))?\s*$", re.I)),
     ("timeline", re.compile(r"^[!！](?:时间线|timeline)(?:\s+(1h|6h|24h|7d))?\s*$", re.I)),
     ("postmortem", re.compile(r"^[!！](?:复盘|事故复盘|postmortem)(?:\s+(1h|6h|24h|7d))?\s*$", re.I)),
-    ("weekly", re.compile(r"^[!！](?:周报|运行报告|weekly)\s*$", re.I)),
+    ("weekly", re.compile(r"^[!！](?:周报|运行报告|weekly|体检)(?:\s+(详情))?\s*$", re.I)),
     ("recipe", re.compile(r"^[!！](?:配方|recipe)\s+(.+?)\s*$", re.I | re.S)),
 )
 
@@ -107,7 +108,7 @@ def dispatch_ops_command(raw, group_id, user_id, privileged, query_fn=None):
         return None
     server, selection_error = _selected(command, group_id, user_id)
     if not server:
-        return OpsReply("%s 拒绝：%s。请在命令中指定已注册的服务器前缀。" %
+        return OpsReply("%s 拒绝：%s。请在命令中明确当前启用的服务器。" %
                         (server_hint(), selection_error or "未指定服务器"))
     name = command["name"]
     public = name in ("mods", "recipe", "weekly")
@@ -120,13 +121,30 @@ def dispatch_ops_command(raw, group_id, user_id, privileged, query_fn=None):
             data = telemetry.inventory()
             if not data:
                 return OpsReply("%s 模组索引尚未生成，请稍后再试。" % telemetry.prefix)
-            reply = OpsReply(format_inventory(data))
+            pages = format_inventory_pages(data)
+            page_arg = command['match'].group(1)
+            if page_arg:
+                page = int(page_arg)
+                if page < 1 or page > len(pages):
+                    reply = OpsReply('%s 清单共 %d 页；请使用 !mods 1 至 !mods %d。' %
+                                     (telemetry.prefix, len(pages), len(pages)))
+                else:
+                    reply = OpsReply(pages[page-1] + '\n第 %d/%d 页；%s !mods <页码>' %
+                                     (page, len(pages), telemetry.prefix))
+            else:
+                reply = OpsReply(pages[0], pages=tuple(pages) if len(pages) > 1 else (),
+                                 page_command=telemetry.prefix + ' !mods')
         elif name == "errors":
             window = command["match"].group(1) or "6h"
             reply = OpsReply(_error_summary(telemetry, window))
         elif name == "lag":
-            if server.get("server_dir") and Path(server["server_dir"]).is_dir():
-                data = telemetry.collect_lag_evidence("qq-readonly")
+            arg = (command['match'].group(1) or '').strip()
+            if arg not in ('', '最新', 'latest'):
+                return OpsReply('用法：!卡顿取证 发起后台采集；!卡顿取证 最新 查看上次结果。')
+            if arg in ('最新', 'latest'):
+                data = _read(telemetry.root / "lag-latest.json")
+            elif server.get("server_dir") and Path(server["server_dir"]).is_dir():
+                data = telemetry.collect_lag_evidence("管理员手动取证")
             else:
                 data = _read(telemetry.root / "lag-latest.json")
             reply = OpsReply(telemetry.format_lag(data) if data else
@@ -149,7 +167,8 @@ def dispatch_ops_command(raw, group_id, user_id, privileged, query_fn=None):
             window = command["match"].group(1) or "24h"
             reply = OpsReply(telemetry.format_postmortem(telemetry.incident_postmortem(window)))
         elif name == "weekly":
-            reply = OpsReply(telemetry.format_weekly(telemetry.weekly_report()))
+            details = bool(command['match'].group(1)) or '体检' in command['cleaned']
+            reply = OpsReply(telemetry.format_weekly(telemetry.weekly_report(), details=details))
         elif name == "recipe":
             query = command["match"].group(1).strip()
             index = telemetry.recipes()

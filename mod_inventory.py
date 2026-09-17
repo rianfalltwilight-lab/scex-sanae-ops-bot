@@ -15,6 +15,7 @@ import re
 import time
 import zipfile
 from pathlib import Path
+from mod_inventory_details import read_metadata, enrich, inventory_pages
 
 
 CATEGORY_ORDER = (
@@ -95,48 +96,7 @@ def _manifest(text):
 
 
 def read_jar_metadata(path):
-    path = Path(path)
-    info = {
-        "file": path.name, "id": path.stem, "name": path.stem,
-        "version": "", "dependencies": [], "side": "unknown", "metadata": "filename",
-    }
-    try:
-        with zipfile.ZipFile(str(path)) as jar:
-            names = set(jar.namelist())
-            if "fabric.mod.json" in names:
-                raw = json.loads(jar.read("fabric.mod.json").decode("utf-8-sig", "replace"))
-                info.update({
-                    "id": _safe_text(raw.get("id"), 100) or path.stem,
-                    "name": _safe_text(raw.get("name")) or path.stem,
-                    "version": _safe_text(raw.get("version"), 80),
-                    "dependencies": sorted((raw.get("depends") or {}).keys())[:80],
-                    "side": _safe_text(raw.get("environment"), 30) or "unknown",
-                    "metadata": "fabric.mod.json",
-                })
-            else:
-                toml_name = next((name for name in (
-                    "META-INF/neoforge.mods.toml", "META-INF/mods.toml") if name in names), "")
-                if toml_name:
-                    text = jar.read(toml_name).decode("utf-8-sig", "replace")
-                    mod_id = _toml_value(text, "modId") or path.stem
-                    info.update({
-                        "id": mod_id,
-                        "name": _toml_value(text, "displayName") or mod_id,
-                        "version": _toml_value(text, "version"),
-                        "dependencies": _toml_dependencies(text, mod_id),
-                        "side": _toml_value(text, "side") or "unknown",
-                        "metadata": toml_name,
-                    })
-                elif "META-INF/MANIFEST.MF" in names:
-                    rows = _manifest(jar.read("META-INF/MANIFEST.MF").decode("utf-8", "replace"))
-                    info.update({
-                        "name": _safe_text(rows.get("Implementation-Title") or rows.get("Specification-Title")) or path.stem,
-                        "version": _safe_text(rows.get("Implementation-Version"), 80),
-                        "metadata": "META-INF/MANIFEST.MF",
-                    })
-    except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
-        info["metadata_error"] = type(exc).__name__
-    return info
+    return read_metadata(path)
 
 
 def classify_mod(info):
@@ -172,9 +132,9 @@ def scan_installed_mods(server_dir, server_id="unknown", prefix="[未知服]"):
         item["category"] = classify_mod(item)
         mods.append(item)
     return {
-        "schema": 1, "server": server_id, "prefix": prefix,
+        "schema": 2, "server": server_id, "prefix": prefix,
         "generated_at": time.time(), "signature": jar_signature(mods_dir),
-        "count": len(mods), "mods": mods,
+        "count": len(mods), "mods": enrich(mods),
     }
 
 
@@ -201,3 +161,7 @@ def format_inventory(data, max_chars=3600):
             lines.append(line)
     return "\n".join(lines)
 
+
+
+def format_inventory_pages(data, max_chars=2800):
+    return inventory_pages(data, CATEGORY_ORDER, max_chars)

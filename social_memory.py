@@ -9,6 +9,7 @@ credential/path material.
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -46,13 +47,28 @@ class SocialMemory:
             data = json.loads(self.path.read_text(encoding="utf-8-sig"))
             rows = data.get("topics", {}) if isinstance(data, dict) else {}
             if isinstance(rows, dict):
-                self._topics = {str(k): v for k, v in rows.items() if isinstance(v, dict)}
+                now = int(time.time())
+                for term, row in list(rows.items())[:2000]:
+                    if not isinstance(row,dict) or _SENSITIVE.search(str(term)):
+                        continue
+                    last = int(row.get('lastSeen') or 0)
+                    if last > now+60 or last < now-7*86400:
+                        continue
+                    # Legacy totals have no daily distribution or speaker IDs.
+                    # Retain only the single observation evidenced by lastSeen.
+                    buckets = row.get('buckets') if data.get('version') == 2 else {str(last//86400):1}
+                    if not isinstance(buckets,dict):
+                        continue
+                    self._topics[str(term).casefold()] = dict(row,buckets={
+                        str(day):max(0,min(100000,int(count))) for day,count in buckets.items()
+                        if str(day).isdigit() and now//86400-6 <= int(day) <= now//86400})
+                self._prune(now)
         except (OSError, ValueError, TypeError):
             self._topics = {}
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 1, "groupId": self.group_id, "topics": self._topics}
+        payload = {"version": 2, "groupId": self.group_id, "topics": self._topics}
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.path)
@@ -65,11 +81,35 @@ class SocialMemory:
             return []
         out = []
         for term in _CJK.findall(clean) + _ASCII.findall(clean):
+            term = term.casefold()
             if term in _COMMON or term.casefold() in {x.casefold() for x in _COMMON}:
                 continue
             if term not in out:
                 out.append(term)
         return out[:12]
+
+    def _prune(self, now):
+        today = now//86400
+        for term, row in list(self._topics.items()):
+            buckets = {day:count for day,count in row.get('buckets',{}).items()
+                       if today-6 <= int(day) <= today and count > 0}
+            if not buckets:
+                del self._topics[term]
+                continue
+            row['buckets'] = buckets
+            row['count'] = sum(buckets.values())
+        if len(self._topics) > self.max_topics:
+            # Reserve space for recent arrivals so first observations can grow.
+            recent = sorted(self._topics,key=lambda k:self._topics[k].get('lastSeen',0),reverse=True)
+            keep = recent[:max(1,self.max_topics//4)]
+            ranked = sorted(self._topics,key=lambda k:self._score(self._topics[k],now),reverse=True)
+            keep += [term for term in ranked if term not in keep][:self.max_topics-len(keep)]
+            self._topics = {term:self._topics[term] for term in keep}
+
+    @staticmethod
+    def _score(row, now):
+        return sum(count*math.exp(-max(0,now-int(day)*86400)/(3*86400))
+                   for day,count in row.get('buckets',{}).items())
 
     def observe(self, event: dict[str, Any]) -> None:
         if str(event.get("group_id")) != self.group_id:
@@ -82,16 +122,17 @@ class SocialMemory:
             return
         now = int(time.time())
         with self._lock:
+            self._prune(now)
             new_topic = False
             for term in terms:
                 if term not in self._topics:
                     new_topic = True
-                row = self._topics.setdefault(term, {"count": 0, "firstSeen": now})
-                row["count"] = int(row.get("count") or 0) + 1
+                row = self._topics.setdefault(term, {"count": 0, "firstSeen": now,'buckets':{}})
+                day = str(now//86400)
+                row['buckets'][day] = row['buckets'].get(day,0)+1
+                row["count"] = sum(row['buckets'].values())
                 row["lastSeen"] = now
-            if len(self._topics) > self.max_topics:
-                ordered = sorted(self._topics.items(), key=lambda x: (int(x[1].get("count") or 0), int(x[1].get("lastSeen") or 0)), reverse=True)
-                self._topics = dict(ordered[:self.max_topics])
+            self._prune(now)
             # Avoid a JSON rewrite for every chat message.  New topics are
             # flushed immediately; existing counters are persisted at most
             # once per 15 seconds.
@@ -101,13 +142,15 @@ class SocialMemory:
 
     def context(self, limit: int = 8) -> str:
         with self._lock:
-            rows = sorted(self._topics.items(), key=lambda x: (int(x[1].get("count") or 0), int(x[1].get("lastSeen") or 0)), reverse=True)
+            now = int(time.time())
+            self._prune(now)
+            rows = sorted(self._topics.items(), key=lambda x:self._score(x[1],now),reverse=True)
             rows = rows[:max(1, min(12, int(limit)))]
         if not rows:
             return ""
-        return "〖近期群聊长期主题（仅作语境参考）〗\n" + "、".join(
-            f"{term}（{int(row.get('count') or 0)}次）" for term, row in rows
-        )
+        return ("〖近七天群话题线索；不是发言统计，也不属于任何特定群友〗\n" +
+                "、".join(term for term,row in rows) +
+                "\n只在与当前话题相关时参考；总结群聊、个人次数或排名必须查询真实记录。")
 
     def status(self) -> dict[str, Any]:
         with self._lock:

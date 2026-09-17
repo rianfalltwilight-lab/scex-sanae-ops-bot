@@ -5,6 +5,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import media_ai
+import media_transport
 
 
 class MediaAiTests(unittest.TestCase):
@@ -13,11 +14,11 @@ class MediaAiTests(unittest.TestCase):
             os.environ.pop("SANAE_AUDIO_TRANSCRIPTION_ENABLED", None)
             text, status = media_ai.transcribe({"data": b"x", "contentType": "audio/wav"})
         self.assertIsNone(text)
-        self.assertIn("disabled", status)
+        self.assertIn("未启用", status)
 
     def test_explicit_media_is_downloaded_once(self):
         event = {"message": [{"type": "record", "data": {"url": "https://example.invalid/a"}}]}
-        with mock.patch.object(media_ai, "_download", return_value=(b"audio", "audio/wav")) as download:
+        with mock.patch.object(media_transport, "download", return_value=(b"audio", "audio/wav")) as download:
             items = media_ai.fetch_segments(event, "http://127.0.0.1:3002")
         self.assertEqual(len(items), 1)
         download.assert_called_once()
@@ -32,7 +33,7 @@ class MediaAiTests(unittest.TestCase):
         os.environ.pop("SANAE_VIDEO_UNDERSTANDING_ENABLED", None)
         result, status = media_ai.understand_video({"data": b"x", "contentType": "video/mp4"})
         self.assertIsNone(result)
-        self.assertIn("disabled", status)
+        self.assertIn("未启用", status)
 
 
 if __name__ == "__main__":

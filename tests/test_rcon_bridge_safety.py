@@ -176,7 +176,7 @@ class BridgeRoutingPureTests(unittest.TestCase):
                 selected, error = registry.get_selected('g', 'u')
                 self.assertEqual('legacy', selected['id'])
                 self.assertIsNone(error)
-                self.assertIn('普通群消息仍同步两服', b._selection_reply('!服', 'g', 'u'))
+                self.assertIn('普通群消息转发仍按现有配置', b._selection_reply('!服', 'g', 'u'))
                 self.assertIn('已清除', b._selection_reply('!服 自动', 'g', 'u'))
                 self.assertIsNone(b._selection_reply('!wiki ae2', 'g', 'u'))
 
@@ -253,9 +253,9 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertTrue(b._natural_server_operation_candidate(
             '[CQ:at,qq=1] 现在多少天了', False, at_call=True))
         self.assertTrue(b._natural_server_operation_candidate(
-            '怀旧服现在在线几个人', False))
+            '怀旧服现在在线几个人', False, at_call=True))
         self.assertTrue(b._natural_server_operation_candidate(
-            '给 ExamplePlayer OP', True))
+            '给 ExamplePlayer OP', True, at_call=True))
         self.assertFalse(b._natural_server_operation_candidate('给你看个图片', True))
         self.assertFalse(b._natural_server_operation_candidate('今天几号', False))
         self.assertFalse(b._natural_server_operation_candidate('给 ExamplePlayer OP', False))

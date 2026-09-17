@@ -16,6 +16,7 @@ import re
 import time
 import urllib.request
 from collections import Counter
+from lag_forensics import parse_ticks, coordinator, format_capture
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from recipe_index import (atomic_write_json as write_recipe_json, build_recipe_i
 
 WINDOWS = {"1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "week": 604800}
 ERROR_LEVEL = re.compile(r"(?:/|\s|\[)(ERROR|FATAL|WARN)(?:\]|\s|:)", re.I)
-SOFT_NOISE = re.compile(r"^\s*(?:at\s+[\w.$]+\(|\.\.\.\s+\d+\s+more|Caused by:)", re.I)
+SOFT_NOISE = re.compile(r"^\s*(?:at\s+[\w.$]+\(|\.\.\.\s+\d+\s+more)", re.I)
 CRITICAL_ERROR = re.compile(
     r"\bFATAL\b|Watchdog|OutOfMemoryError|Failed to start (?:the )?(?:minecraft )?server|"
     r"Exception stopping (?:the )?server|Preparing crash report|A single server tick took",
@@ -60,11 +61,20 @@ def _read_json(path, default=None):
         return default
 
 
-def _read_jsonl(path, since=0.0, limit=20000):
+def _read_jsonl(path, since=0.0, limit=20000, max_bytes=8 * 1024 * 1024):
+    """Read a bounded recent JSONL tail; operational streams are chronological."""
     rows = []
     try:
-        with Path(path).open(encoding="utf-8-sig", errors="replace") as stream:
-            for line in stream:
+        source = Path(path)
+        size = source.stat().st_size
+        start = max(0, size - max(4096, int(max_bytes)))
+        with source.open("rb") as stream:
+            stream.seek(start)
+            raw = stream.read(size - start)
+        if start:
+            newline = raw.find(b"\n")
+            raw = raw[newline + 1:] if newline >= 0 else b""
+        for line in raw.decode("utf-8-sig", errors="replace").splitlines():
                 try:
                     row = json.loads(line)
                 except ValueError:
@@ -140,7 +150,7 @@ class OpsTelemetry:
     def fingerprints_path(self):
         return self.root / "error-fingerprints.jsonl"
 
-    def observe_lines(self, lines, now=None, cooldown=3600, digest_interval=3600,
+    def observe_lines(self, lines, now=None, cooldown=3600, digest_interval=21600,
                       digest_min_count=3):
         now = float(time.time() if now is None else now)
         state_path = self.root / "fingerprint-state.json"
@@ -225,12 +235,18 @@ class OpsTelemetry:
     def _query(self, command):
         if not self.query_fn:
             raise RuntimeError("RCON query unavailable")
-        return str(self.query_fn(command) or "")
+        from request_runtime import Budget, CURRENT
+        budget = Budget(12, parent=CURRENT.get())
+        token = CURRENT.set(budget)
+        try:
+            return str(self.query_fn(command) or "")
+        finally:
+            CURRENT.reset(token)
 
     def sample_runtime(self, now=None):
         now = float(now or time.time())
         row = {"timestamp": now, "server": self.server_id, "players": None,
-               "max_players": None, "tps": None, "mspt": None, "errors": []}
+               "max_players": None, "tps": None, "mspt": None, "errors": [], "tick_parser": 2}
         try:
             output = self._query("list")
             match = re.search(r"(?:There are|当前共有)\s*(\d+).*?(?:max of|最多可容纳)\s*(\d+)", output, re.I)
@@ -240,12 +256,7 @@ class OpsTelemetry:
             row["errors"].append("list:" + type(exc).__name__)
         try:
             output = self._query("neoforge tps")
-            tps_values = [float(value) for value in re.findall(r"(?i)TPS[^0-9]{0,12}(\d+(?:\.\d+)?)", output)]
-            mspt_values = [float(value) for value in re.findall(r"(?i)MSPT[^0-9]{0,12}(\d+(?:\.\d+)?)", output)]
-            if tps_values:
-                row["tps"] = min(tps_values)
-            if mspt_values:
-                row["mspt"] = max(mspt_values)
+            row.update(parse_ticks(output))
         except Exception as exc:
             row["errors"].append("tps:" + type(exc).__name__)
         append_jsonl(self.root / "perf-samples.jsonl", row)
@@ -253,38 +264,14 @@ class OpsTelemetry:
         return row
 
     def collect_lag_evidence(self, reason="manual", now=None):
-        now = float(now or time.time())
-        runtime = self.sample_runtime(now)
-        out_dir = self.root / "lag" / datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        latest = self.server_dir / "logs" / "latest.log"
-        matches = []
-        try:
-            lines = latest.read_text(encoding="utf-8", errors="replace").splitlines()[-5000:]
-            rx = re.compile(r"ERROR|FATAL|Can't keep up|Running.*ms behind|Watchdog", re.I)
-            matches = [_safe_sample(line) for line in lines if rx.search(line)][-80:]
-        except OSError:
-            pass
-        meta = {"schema": 1, "server": self.server_id, "prefix": self.prefix,
-                "timestamp": now, "reason": reason, "runtime": runtime,
-                "log_matches": matches, "thread_dump": "not_auto",
-                "spark": "not_auto"}
-        write_json(out_dir / "meta.json", meta)
-        summary = self.format_lag(meta)
-        (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
-        write_json(self.root / "lag-latest.json", meta)
-        self.record_event("lag_evidence", summary, occurred_at=now, reason=reason)
-        return meta
+        return coordinator(self).request(reason)
 
     def format_lag(self, meta):
-        runtime = meta.get("runtime") or {}
-        players = ("%s/%s" % (runtime.get("players"), runtime.get("max_players"))
-                   if runtime.get("players") is not None else "暂不可查")
-        tps = runtime.get("tps") if runtime.get("tps") is not None else "暂不可查"
-        mspt = runtime.get("mspt") if runtime.get("mspt") is not None else "暂不可查"
-        return ("%s 卡顿取证已落盘｜TPS %s｜MSPT %s｜在线 %s｜错误样本 %d\n"
-                "线程转储和 Spark 不由 QQ 自动触发；需要时交给 Codex 审批执行。" %
-                (self.prefix, tps, mspt, players, len(meta.get("log_matches") or [])))
+        if meta.get('schema') == 2:
+            return format_capture(meta)
+        runtime = meta.get('runtime') or {}
+        return '%s 历史简版取证：TPS %s · MSPT %s；未采集线程栈或 Spark。' % (
+            self.prefix, runtime.get('tps'), runtime.get('mspt'))
 
     def refresh_indexes(self, force=False):
         mods_path = self.root / "mod-inventory.json"
@@ -294,7 +281,7 @@ class OpsTelemetry:
         mod_sig = jar_signature(self.server_dir / "mods")
         recipe_sig = recipe_signature(self.server_dir)
         changed = []
-        if force or current_mods.get("signature") != mod_sig:
+        if force or current_mods.get("schema") != 2 or current_mods.get("signature") != mod_sig:
             write_json(mods_path, scan_installed_mods(self.server_dir, self.server_id, self.prefix))
             changed.append("mods")
         if force or current_recipes.get("signature") != recipe_sig:
@@ -328,12 +315,10 @@ class OpsTelemetry:
                 sample = self.sample_runtime(now)
                 actions.append("sample")
                 state["sample"] = now
-                low = ((sample.get("tps") is not None and float(sample["tps"]) < 18.0) or
-                       (sample.get("mspt") is not None and float(sample["mspt"]) > 70.0))
-                if low and due("lag", 1800):
-                    self.collect_lag_evidence("threshold", now)
-                    state["lag"] = now
-                    actions.append("lag")
+                if self.server_id == 'legacy':
+                    result = coordinator(self).observe(sample)
+                    if result and result.get('status') == 'queued':
+                        actions.append('lag-queued')
             except Exception as exc:
                 errors.append("sample:" + type(exc).__name__)
         if due("index", index_interval):
@@ -365,7 +350,10 @@ class OpsTelemetry:
         return {"actions": actions, "errors": errors}
 
     def inventory(self):
-        return _read_json(self.root / "mod-inventory.json", {}) or {}
+        data = _read_json(self.root / "mod-inventory.json", {}) or {}
+        if data.get('schema') != 2 and (self.server_dir / 'mods').is_dir():
+            data = scan_installed_mods(self.server_dir, self.server_id, self.prefix)
+        return data
 
     def recipes(self):
         return _read_json(self.root / "recipe-index.json", {}) or {}
@@ -436,33 +424,12 @@ class OpsTelemetry:
                  data.get("conclusion", "")))
 
     def weekly_report(self, now=None):
-        now = float(now or time.time())
-        since = now - WINDOWS["7d"]
-        perf = _read_jsonl(self.root / "perf-samples.jsonl", since)
-        tps = [float(row["tps"]) for row in perf if row.get("tps") is not None]
-        mspt = [float(row["mspt"]) for row in perf if row.get("mspt") is not None]
-        players = [int(row["players"]) for row in perf if row.get("players") is not None]
-        timeline = self.timeline("7d", now)
-        counts = Counter(row.get("kind") for row in timeline.get("events") or [])
-        backup = _read_json(self.root / "backup-verify.json", {}) or {}
-        data = {"schema": 1, "server": self.server_id, "prefix": self.prefix,
-                "generated_at": now, "samples": len(perf), "min_tps": min(tps) if tps else None,
-                "max_mspt": max(mspt) if mspt else None, "peak_players": max(players) if players else None,
-                "events": dict(counts), "backup_ok": backup.get("ok"),
-                "backup_checked_at": backup.get("generated_at")}
-        write_json(self.root / "weekly-latest.json", data)
-        return data
+        from weekly_reports import build_report
+        return build_report(self, now=now)
 
-    def format_weekly(self, data):
-        events = data.get("events") or {}
-        value = lambda item: item if item is not None else "暂不可查"
-        backup = "通过" if data.get("backup_ok") is True else (
-            "失败" if data.get("backup_ok") is False else "未验证")
-        return ("%s 近 7 天运行报告\n样本 %d｜最低 TPS %s｜最高 MSPT %s｜峰值在线 %s\n"
-                "崩溃 %d｜错误告警 %d｜卡顿 %d｜最近备份验证 %s" %
-                (self.prefix, data.get("samples", 0), value(data.get("min_tps")),
-                 value(data.get("max_mspt")), value(data.get("peak_players")),
-                 events.get("crash", 0), events.get("error", 0), events.get("lag", 0), backup))
+    def format_weekly(self, data, details=False):
+        from weekly_reports import format_report
+        return format_report(data, details=details)
 
 
 SNAPSHOT_FILES = (
@@ -524,7 +491,7 @@ def decode_snapshot_export(value, max_packed=8 * 1024 * 1024,
     return json.loads(raw.decode("utf-8"))
 
 
-def ingest_snapshot(state_base, payload, expected_server="minecraft-server"):
+def ingest_snapshot(state_base, payload, expected_server="nast"):
     if not isinstance(payload, dict) or payload.get("schema") != 1:
         raise ValueError("invalid snapshot schema")
     server = str(payload.get("server") or "")

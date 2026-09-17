@@ -17,10 +17,8 @@ from contextvars import ContextVar
 from rcon_client import RconClient
 
 
-_DEFAULT_REGISTRY = os.path.join(os.path.dirname(__file__), 'servers.json')
-if os.environ.get('SCE_BOT_TEST_MODE') == '1' and not os.path.exists(_DEFAULT_REGISTRY):
-    _DEFAULT_REGISTRY = os.path.join(os.path.dirname(__file__), 'examples', 'servers.example.json')
-REGISTRY_PATH = os.environ.get('SCE_SERVER_REGISTRY', _DEFAULT_REGISTRY)
+REGISTRY_PATH = os.environ.get(
+    'SCE_SERVER_REGISTRY', os.path.join(os.path.dirname(__file__), 'servers.json'))
 SELECTION_TTL = int(os.environ.get('SCE_SERVER_SELECTION_TTL', '0'))
 SELECTION_PATH = os.environ.get(
     'SCE_SERVER_SELECTION_PATH',
@@ -214,7 +212,7 @@ def parse_player_list(output):
 
 
 def extract_server_selector(text):
-    """从任意位置的 ``[服务器别名]`` 提取服务器并移除一次标记。"""
+    """从任意位置的 ``[nast]``/``[怀旧]`` 提取服务器并移除一次标记。"""
     original = html.unescape(str(text or ''))
     for match in re.finditer(r'\[([^\]\r\n]{1,32})\]', original):
         server = resolve_server(match.group(1))
@@ -232,6 +230,7 @@ def extract_natural_server_selector(text):
     original = html.unescape(str(text or ''))
     patterns = (
         (resolve_server('legacy'), re.compile(r'(?i)(?:SCEX\s*Legacy\s*Genesis|Legacy\s*Genesis|怀旧(?:服|服务器))')),
+        (resolve_server('nast'), re.compile(r'(?i)(?<![A-Za-z0-9_])NAST(?:服|服务器)?(?![A-Za-z0-9_])')),
     )
     found = []
     for item, pattern in patterns:

@@ -224,7 +224,7 @@ def _font(size, bold=False):
     from PIL import ImageFont
     candidates = (
         "/mnt/c/Windows/Fonts/msyhbd.ttc" if bold else "/mnt/c/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
+        str(Path(os.environ.get("WINDIR", "Windows")) / "Fonts" / "msyhbd.ttc") if bold else str(Path(os.environ.get("WINDIR", "Windows")) / "Fonts" / "msyh.ttc"),
         "/System/Library/Fonts/PingFang.ttc", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     )

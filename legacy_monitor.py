@@ -13,6 +13,9 @@ from datetime import datetime
 from onebot_utf8 import JSON_CONTENT_TYPE, json_bytes, onebot_success_utf8, utf8_text
 from ops_contract import read_incremental_lines
 from ops_telemetry import OpsTelemetry
+from weekly_reports import publish_due
+from startup_notice import StartupNotifier
+from lag_forensics import coordinator
 from server_registry import parse_player_list, query_server, resolve_server, server_prefix
 from advancement_localization import AdvancementLocalizer
 
@@ -30,6 +33,7 @@ POLL_SECONDS = max(2, int(os.environ.get('LEGACY_MONITOR_INTERVAL', '5')))
 os.makedirs(STATE_DIR, exist_ok=True)
 OPS = OpsTelemetry('legacy', PREFIX, SERVER_DIR,
                    query_fn=lambda command: query_server(SERVER, command))
+STARTUP = StartupNotifier(SERVER, OPS.root)
 ADVANCEMENTS = AdvancementLocalizer(
     SERVER_DIR, os.path.join(STATE_DIR, 'legacy-advancement-localization.json'),
     extra_roots=[item for item in os.environ.get('ADVANCEMENT_PACK_ROOTS', '').split(os.pathsep)
@@ -259,9 +263,14 @@ def scan_once(push_fn=push_group):
         'legacy-ops-management-pending', ops_alerts,
         LLBOT_MANAGEMENT_GROUP, 10, push_fn)
     if push_fn is push_group:
+        STARTUP.poll(push_fn, LLBOT_GROUP)
+        coordinator(OPS).deliver(lambda summary: push_fn(summary, LLBOT_GROUP))
         maintenance = OPS.periodic_maintenance()
         if maintenance['errors']:
             print(f'{PREFIX} [ops采集] ' + ','.join(maintenance['errors']), file=sys.stderr)
+        weekly_status = publish_due(OPS, push_fn, LLBOT_GROUP)
+        if weekly_status == 'generation-failed':
+            print(f'{PREFIX} [周报] 生成失败，30分钟后重试；详见 weekly-delivery.json', file=sys.stderr)
     if player_batch:
         print('\n'.join(player_batch), flush=True)
     return player_batch
