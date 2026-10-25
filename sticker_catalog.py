@@ -283,7 +283,8 @@ class StickerCatalog:
             return None
         if not file_path.is_file():
             return None
-        return f"[CQ:image,file=file:///{quote(str(file_path).replace('\\', '/'), safe='/:')}]"
+        normalized_path = str(file_path).replace('\\', '/')
+        return f"[CQ:image,file=file:///{quote(normalized_path, safe='/:')}]"
 
     def command(self, raw, privileged=False):
         text = str(raw or '').strip()

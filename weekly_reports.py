@@ -58,8 +58,7 @@ def write_json(path, data):
 
 @contextmanager
 def locked(path):
-    """Real Windows byte lock; the project's fcntl shim is process-local."""
-    import msvcrt
+    """Cross-process byte lock; POSIX lockf avoids the local fcntl shim."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _THREAD_LOCK, path.open('a+b') as handle:
@@ -67,12 +66,19 @@ def locked(path):
             handle.write(b'0')
             handle.flush()
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            os.lockf(handle.fileno(), os.F_LOCK, 1)
         try:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            if os.name == 'nt':
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                os.lockf(handle.fileno(), os.F_ULOCK, 1)
 
 
 def number(value, low=0, high=float('inf')):

@@ -351,7 +351,20 @@ class MediaTests(unittest.TestCase):
         self.assertIn('未启用', result['status'])
 
     def test_untrusted_local_media_path_is_not_read(self):
-        with self.assertRaises(ValueError): transport.trusted_onebot_file('C:/Windows/win.ini', 100)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            allowed = root / 'allowed'
+            allowed.mkdir()
+            outside = root / 'outside.wav'
+            outside.write_bytes(wav_bytes())
+            with patch.object(transport, 'LLBOT_BIN', allowed / 'llbot' / 'bin'), \
+                 patch.object(transport.tempfile, 'gettempdir', return_value=str(allowed)), \
+                 patch.object(Path, 'home', return_value=allowed / 'home'), \
+                 patch.dict(transport.os.environ, {'SANAE_MEDIA_CACHE_ROOTS': ''}), \
+                 patch.object(Path, 'open', side_effect=AssertionError('untrusted file opened')) as opened:
+                with self.assertRaises(ValueError):
+                    transport.trusted_onebot_file(str(outside), 100)
+                opened.assert_not_called()
 
     def test_download_size_limit(self):
         with self.assertRaises(ValueError): transport.read_bounded(io.BytesIO(b'x' * 10), 9)
