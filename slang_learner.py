@@ -91,9 +91,18 @@ class SlangLearner:
             old = len(self._entries); self._entries = [x for x in self._entries if x.get("term") != _clean(term,32)]
             if len(self._entries) == old: return False
             self._save(); return True
-    def context(self, limit=12):
+    def context(self, limit=12, *, text=''):
+        current = _clean(text, 6000).casefold()
+        if not current:
+            return ''
         with self._lock:
-            items = [x for x in self._entries if x.get("status") == "confirmed" and x.get("meaning")]; items.sort(key=lambda x:int(x.get("count") or 0), reverse=True)
+            items = []
+            for item in self._entries:
+                term = str(item.get('term') or '').casefold().strip(' ？?！!。.,，:：')
+                if (item.get('status') == 'confirmed' and item.get('meaning')
+                        and re.search(r'\w', term) and term in current):
+                    items.append(item)
+            items.sort(key=lambda x:int(x.get("count") or 0), reverse=True)
             rows = [f"- {x['term']}：{x['meaning']}" + (f"（{x['usage']}）" if x.get("usage") else "") for x in items[:max(1,min(30,int(limit)))]]
             return ("〖群聊黑话表〗只在自然语境下参考，不要刻意堆砌：\n" + "\n".join(rows)) if rows else ""
     def report(self, candidates=False):

@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from mcfile_client import mcfile_get
+import backup_local
 
 HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / "logs"
@@ -44,7 +45,7 @@ def _write_json(path: Path, data) -> None:
 
 
 def _backups() -> list[dict]:
-    entries = json.loads(mcfile_get("/list", path=BACKUP_DIR))
+    entries = backup_local.backups() if backup_local.enabled() else json.loads(mcfile_get("/list", path=BACKUP_DIR))
     return sorted(
         (e for e in entries if not e.get("dir") and str(e.get("name", "")).endswith(".zip")),
         key=lambda e: (int(e.get("mtime", 0)), str(e.get("name", ""))),
@@ -55,10 +56,10 @@ def _pipeline_busy() -> bool:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     with PIPELINE_LOCK_PATH.open("a+") as fp:
         try:
-            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            backup_local.lock(fp)
         except BlockingIOError:
             return True
-        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+        backup_local.unlock(fp)
     return False
 
 

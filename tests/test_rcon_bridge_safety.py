@@ -35,6 +35,7 @@ if os.path.isdir(PACKAGE_SRC):
     HERE = PACKAGE_SRC
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
 os.environ.setdefault("SCE_SERVER_REGISTRY", os.path.join(HERE, "examples", "servers.example.json"))
 
 r = importlib.import_module("rcon_ops")
@@ -114,11 +115,11 @@ class RiskConfirmationTests(unittest.TestCase):
             return 'ok'
 
         def nast(command):
-            calls.append(('secondary', command))
+            calls.append(('nast', command))
             return 'ok'
 
         legacy.server_id = 'legacy'
-        nast.server_id = 'secondary'
+        nast.server_id = 'nast'
         text = r.dispatch('restart', 'n', 'owner', True, query_fn=legacy)
         code = self._code(text)
         denied = r.dispatch('确认 ' + code, 'n', 'owner', True, query_fn=nast)
@@ -192,7 +193,7 @@ class BridgeRoutingPureTests(unittest.TestCase):
                   'version_label': 'SCEX Legacy Genesis（Minecraft 1.21.1 + NeoForge 21.1.248）'}
         with mock.patch.object(b, 'get_selected', return_value=(None, '未设置')), \
              mock.patch.object(b, 'list_servers', return_value=[legacy]):
-            target, command, explicit, error = b._command_target('！cmd say test', 'g', 'u')
+            target, command, explicit, error = b._command_target('！cmd say test', b.LLBOT_GROUP, 'u')
             self.assertEqual('legacy', target['id'])
             self.assertEqual('!cmd say test', command)
             self.assertFalse(explicit)
@@ -238,13 +239,13 @@ class BridgeRoutingPureTests(unittest.TestCase):
             '[CQ:at,qq=1002] 早苗，怀旧服给 ExamplePlayer OP')
         self.assertEqual('legacy', target['id'])
         self.assertNotIn('怀旧服', cleaned)
-        target, _ = registry.extract_natural_server_selector('早苗，副服查一下 tps')
+        target, _ = registry.extract_natural_server_selector('早苗，NAST服查一下 tps')
         self.assertIsNone(target)
 
     def test_single_enabled_server_is_unambiguous_for_natural_ops(self):
         with mock.patch.object(b, 'get_selected', return_value=(None, '未设置')):
             target, cleaned, unambiguous = b._ai_operation_target(
-                '[CQ:at,qq=1002] 给AnotherPlayer OP', 'g', 'u')
+                '[CQ:at,qq=1002] 给AnotherPlayer OP', b.LLBOT_GROUP, 'u')
         self.assertEqual('legacy', target['id'])
         self.assertIn('AnotherPlayer', cleaned)
         self.assertTrue(unambiguous)

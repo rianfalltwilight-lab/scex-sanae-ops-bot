@@ -27,13 +27,13 @@ _SENSITIVE = re.compile(
 _COMMON = {
     "现在", "今天", "这个", "那个", "什么", "怎么", "为什么", "有没有", "一下",
     "真的", "不是", "就是", "然后", "已经", "还是", "大家", "我们", "你们",
-    "看看", "服务器", "游戏", "玩家", "消息", "早苗", "群里", "谢谢", "收到",
+    "看看", "服务器", "游戏", "玩家", "消息", "早苗", "八千代", "月见八千代", "八千", "千代", "月见", "月見", "yachiyo", "yachiyo8000", "ヤチヨ", "群里", "谢谢", "收到",
 }
 
 
 class SocialMemory:
     def __init__(self, path: str | Path, group_id: int | str = 0,
-                 max_topics: int = 80):
+                 max_topics: int = 240):
         self.path = Path(path)
         self.group_id = str(group_id)
         self.max_topics = max(20, int(max_topics))

@@ -2,10 +2,20 @@
 # -*- coding: utf-8 -*-
 """OneBot JSON 的唯一 UTF-8 编解码入口。"""
 import json
+import os
 
 
 JSON_CONTENT_TYPE = 'application/json; charset=utf-8'
 JSON_HEADERS = {'Content-Type': JSON_CONTENT_TYPE}
+
+
+def onebot_headers(token=None):
+    """Headers for OneBot only; an explicit empty token disables authentication."""
+    value = os.environ.get('LLBOT_API_TOKEN', '') if token is None else token
+    headers = {'Content-Type': JSON_CONTENT_TYPE}
+    if value:
+        headers['Authorization'] = 'Bearer ' + str(value)
+    return headers
 
 
 def json_bytes(value):

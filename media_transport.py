@@ -4,6 +4,7 @@ import hashlib
 import io
 import ipaddress
 import json
+from onebot_utf8 import onebot_headers
 import os
 from pathlib import Path
 import re
@@ -62,7 +63,7 @@ def download(url, limit=VIDEO_LIMIT):
 def onebot(api, action, payload):
     check_active()
     request = urllib.request.Request(api.rstrip('/') + '/' + action,
-        data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+        data=json.dumps(payload).encode(), headers=onebot_headers(), method='POST')
     with urllib.request.urlopen(request, timeout=remaining_timeout(15)) as response:
         body = json.loads(read_bounded(response, 2 * 1024 * 1024))
     if body.get('status') != 'ok' or body.get('retcode') != 0:

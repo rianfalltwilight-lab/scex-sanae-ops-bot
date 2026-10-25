@@ -16,7 +16,8 @@ from mod_inventory import format_inventory, format_inventory_pages
 from ops_contract import append_jsonl
 from ops_telemetry import OpsTelemetry
 from recipe_index import format_recipe, query_recipes, render_recipe_png
-from server_registry import extract_server_selector, get_selected, server_prefix, server_hint
+from server_registry import (extract_server_selector, get_group_default, get_selected,
+                             server_prefix, server_hint)
 
 
 STATE_BASE = Path(os.environ.get(
@@ -66,6 +67,11 @@ def _selected(command, group_id, user_id):
     if command.get("server"):
         return command["server"], ""
     server, error = get_selected(group_id, user_id)
+    if not server:
+        server, default_error = get_group_default(group_id)
+        if server:
+            return server, ""
+        error = default_error or error
     return server, error or ""
 
 
@@ -115,6 +121,9 @@ def dispatch_ops_command(raw, group_id, user_id, privileged, query_fn=None):
     if not public and not privileged:
         _audit(name, server, user_id, "denied", "admin required")
         return OpsReply("%s 拒绝：该运维查询仅群主/管理员可用。" % server_prefix(server))
+    if server.get("kind") == "status" and name not in ("mods", "recipe", "weekly"):
+        return OpsReply("%s 目前只接入公开在线状态；日志、TPS、备份和管理接口尚未配置。" %
+                        server_prefix(server))
     telemetry = _telemetry(server, query_fn=query_fn)
     try:
         if name == "mods":

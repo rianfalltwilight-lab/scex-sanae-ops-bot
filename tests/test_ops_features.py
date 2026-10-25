@@ -14,7 +14,8 @@ import server_registry
 from backup_verify import format_backup_verification, verify_backup_zip
 from mod_inventory import format_inventory, scan_installed_mods
 from ops_commands import dispatch_ops_command, match_ops_command
-from ops_telemetry import (OpsTelemetry, build_snapshot_payload, decode_snapshot_export,
+from nast_ops_sync import snapshot_age, sync_if_stale, sync_nast_snapshot
+from ops_telemetry import (SOFT_NOISE, OpsTelemetry, _read_jsonl, build_snapshot_payload, decode_snapshot_export,
                            ingest_snapshot, write_snapshot_export)
 from recipe_index import build_recipe_index, query_recipes, render_recipe_png
 
@@ -129,7 +130,7 @@ mandatory=true
         self.assertIn("紧急", first[0])
 
     def test_unknown_errors_group_by_logger_and_one_off_stays_silent(self):
-        ops = OpsTelemetry("secondary", "[副服]", self.server, state_base=self.root / "state")
+        ops = OpsTelemetry("nast", "[nast]", self.server, state_base=self.root / "state")
         rows = [
             "[1] [Worker/ERROR] [example.Mod/]: First failure for alpha",
             "[2] [Worker/ERROR] [example.Mod/]: Different failure for beta",
@@ -145,30 +146,80 @@ mandatory=true
         self.assertEqual([], single.observe_lines([], now=4601, digest_interval=3600))
 
     def test_timeline_postmortem_weekly(self):
-        ops = OpsTelemetry("secondary", "[副服]", self.server, state_base=self.root / "state")
+        ops = OpsTelemetry("nast", "[nast]", self.server, state_base=self.root / "state")
         now = time.time()
-        ops.record_event("join", "[副服] 玩家 Foo 加入服务器", occurred_at=now - 10)
+        ops.record_event("join", "[nast] 玩家 Foo 加入服务器", occurred_at=now - 10)
         ops.observe_lines(["[Server thread/ERROR] [x]: boom 42"], now=now - 8)
-        ops.record_event("crash", "[副服] 崩溃 crash-test.txt", occurred_at=now - 5)
+        ops.record_event("crash", "[nast] 崩溃 crash-test.txt", occurred_at=now - 5)
         data = ops.timeline("1h", now)
         self.assertTrue(any(row["kind"] == "crash" for row in data["events"]))
         post = ops.incident_postmortem("1h", now)
         self.assertEqual("高", post["severity"])
-        self.assertTrue(ops.format_postmortem(post).startswith("[副服]"))
+        self.assertTrue(ops.format_postmortem(post).startswith("[nast]"))
         weekly = ops.weekly_report(now)
         self.assertIn("events", weekly)
-        self.assertTrue(ops.format_weekly(weekly).startswith("[副服]"))
+        self.assertTrue(ops.format_weekly(weekly).startswith("[nast]"))
 
     def test_snapshot_roundtrip_and_rejects_wrong_server(self):
-        source = OpsTelemetry("secondary", "[副服]", self.server, state_base=self.root / "source")
-        source.record_event("join", "[副服] 玩家 Foo 加入服务器")
+        source = OpsTelemetry("nast", "[nast]", self.server, state_base=self.root / "source")
+        source.record_event("join", "[nast] 玩家 Foo 加入服务器")
         payload = build_snapshot_payload(source)
         target = self.root / "target"
-        ingest_snapshot(target, payload, expected_server="secondary")
-        self.assertTrue((target / "secondary" / "events.jsonl").is_file())
+        ingest_snapshot(target, payload, expected_server="nast")
+        self.assertTrue((target / "nast" / "events.jsonl").is_file())
         payload["server"] = "legacy"
         with self.assertRaises(ValueError):
-            ingest_snapshot(target, payload, expected_server="secondary")
+            ingest_snapshot(target, payload, expected_server="nast")
+
+    def test_ascii_snapshot_export_and_injected_restricted_file_sync(self):
+        source = OpsTelemetry("nast", "[nast]", self.server, state_base=self.root / "source")
+        source.record_event("join", "[nast] 玩家 Foo 加入服务器")
+        export = self.root / "ops-snapshot.json.gz.b64"
+        sizes = write_snapshot_export(source, export)
+        self.assertGreater(sizes["encoded_bytes"], 0)
+        payload = decode_snapshot_export(export.read_text(encoding="ascii"))
+        self.assertEqual("nast", payload["server"])
+        calls = []
+
+        def get_fn(endpoint, **params):
+            calls.append((endpoint, params))
+            return export.read_text(encoding="ascii")
+
+        target = self.root / "target-sync"
+        result = sync_nast_snapshot(target, get_fn=get_fn)
+        self.assertTrue(result["ok"])
+        self.assertEqual("/read", calls[0][0])
+        self.assertEqual("ops-export/ops-snapshot.json.gz.b64", calls[0][1]["path"])
+        self.assertTrue((target / "nast" / "events.jsonl").is_file())
+
+    def test_sync_if_stale_uses_cache_and_refreshes_expired_snapshot(self):
+        target = self.root / "target-stale"
+        meta = target / "nast" / "snapshot-meta.json"
+        meta.parent.mkdir(parents=True)
+        meta.write_text(json.dumps({"received_at": 900.0}), encoding="utf-8")
+        calls = []
+
+        def should_not_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("fresh cache must not perform a cross-host read")
+
+        cached = sync_if_stale(target, max_age=300, get_fn=should_not_run, now=1000.0)
+        self.assertTrue(cached["cached"])
+        self.assertEqual([], calls)
+        self.assertEqual(100.0, snapshot_age(target, now=1000.0))
+
+        source = OpsTelemetry("nast", "[nast]", self.server, state_base=self.root / "source-stale")
+        source.record_event("join", "[nast] 玩家 Foo 加入服务器")
+        export = self.root / "stale-export.b64"
+        write_snapshot_export(source, export)
+
+        def get_fn(endpoint, **params):
+            calls.append((endpoint, params))
+            return export.read_text(encoding="ascii")
+
+        refreshed = sync_if_stale(target, max_age=50, get_fn=get_fn, now=1000.0)
+        self.assertFalse(refreshed["cached"])
+        self.assertEqual("/read", calls[-1][0])
 
     def test_command_routing_prefix_permissions_and_recipe_image(self):
         self.make_content_jar()
@@ -203,6 +254,20 @@ mandatory=true
             ops_commands.STATE_BASE = old_state
             ops_commands.IMAGE_WSL_DIR = old_image
             ops_commands.IMAGE_WINDOWS_DIR = old_windows
+
+    def test_jsonl_reader_uses_bounded_recent_tail(self):
+        path = self.root / "history.jsonl"
+        with path.open("w", encoding="utf-8") as stream:
+            for index in range(5000):
+                stream.write(json.dumps({"timestamp": index, "value": "x" * 80}) + "\n")
+        rows = _read_jsonl(path, since=0, limit=50, max_bytes=4096)
+        self.assertGreater(len(rows), 0)
+        self.assertLessEqual(len(rows), 50)
+        self.assertEqual(rows[-1]["timestamp"], 4999)
+        self.assertGreater(rows[0]["timestamp"], 4900)
+
+    def test_caused_by_is_not_classified_as_soft_stack_noise(self):
+        self.assertIsNone(SOFT_NOISE.match("Caused by: java.lang.ClassNotFoundException: real.mod.Entry"))
 
 
 if __name__ == "__main__":

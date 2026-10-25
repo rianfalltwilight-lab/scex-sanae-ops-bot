@@ -19,6 +19,7 @@ from rcon_client import RconClient
 
 REGISTRY_PATH = os.environ.get(
     'SCE_SERVER_REGISTRY', os.path.join(os.path.dirname(__file__), 'servers.json'))
+GROUP_DEFAULTS_ENV = 'SCE_SERVER_GROUP_DEFAULTS'
 SELECTION_TTL = int(os.environ.get('SCE_SERVER_SELECTION_TTL', '0'))
 SELECTION_PATH = os.environ.get(
     'SCE_SERVER_SELECTION_PATH',
@@ -26,6 +27,21 @@ SELECTION_PATH = os.environ.get(
 _SELECTIONS, _SELECTIONS_LOADED_FROM = {}, None
 _LOCK = threading.RLock()
 _ACTIVE = ContextVar('active_server', default=None)
+
+
+class StatusOnlyError(ConnectionError):
+    """A status-only endpoint was asked to execute an RCON operation."""
+
+
+def _registry_paths():
+    """Return the primary registry plus an optional environment overlay."""
+    paths = [REGISTRY_PATH]
+    extra = os.environ.get('SCE_SERVER_EXTRA_REGISTRY', '').strip()
+    if extra:
+        extra = os.path.abspath(os.path.expanduser(extra))
+        if os.path.abspath(os.path.expanduser(REGISTRY_PATH)) != extra:
+            paths.append(extra)
+    return paths
 
 
 def _normalized_alias(value):
@@ -36,31 +52,32 @@ def _normalized_alias(value):
 
 
 def _validated_rows():
-    with open(REGISTRY_PATH, encoding='utf-8-sig') as stream:
-        data = json.load(stream)
-    rows = data.get('servers', data)
-    if not isinstance(rows, list):
-        raise ValueError('servers.json: servers 必须是数组')
     result = []
     seen_ids = set()
     seen_prefixes = set()
-    for raw in rows:
-        if not raw.get('enabled', True):
-            continue
-        item = dict(raw)
-        item['id'] = str(item.get('id') or item.get('name') or '').strip().casefold()
-        item['name'] = str(item.get('name') or item['id']).strip()
-        item['prefix'] = str(item.get('prefix') or '').strip()
-        if not item['id'] or not item['prefix']:
-            raise ValueError('servers.json: 每服必须设置 id/name/prefix')
-        if item['id'] in seen_ids or item['prefix'] in seen_prefixes:
-            raise ValueError('servers.json: id 和 prefix 必须唯一')
-        seen_ids.add(item['id'])
-        seen_prefixes.add(item['prefix'])
-        aliases = [item['id'], item['name'], item['prefix']]
-        aliases.extend(item.get('aliases') or [])
-        item['aliases'] = sorted({_normalized_alias(value) for value in aliases if value})
-        result.append(item)
+    for path in _registry_paths():
+        with open(path, encoding='utf-8-sig') as stream:
+            data = json.load(stream)
+        rows = data.get('servers', data) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise ValueError(f'{os.path.basename(path)}: servers 必须是数组')
+        for raw in rows:
+            if not isinstance(raw, dict) or not raw.get('enabled', True):
+                continue
+            item = dict(raw)
+            item['id'] = str(item.get('id') or item.get('name') or '').strip().casefold()
+            item['name'] = str(item.get('name') or item['id']).strip()
+            item['prefix'] = str(item.get('prefix') or '').strip()
+            if not item['id'] or not item['prefix']:
+                raise ValueError(f'{os.path.basename(path)}: 每服必须设置 id/name/prefix')
+            if item['id'] in seen_ids or item['prefix'] in seen_prefixes:
+                raise ValueError(f'{os.path.basename(path)}: id 和 prefix 必须唯一')
+            seen_ids.add(item['id'])
+            seen_prefixes.add(item['prefix'])
+            aliases = [item['id'], item['name'], item['prefix']]
+            aliases.extend(item.get('aliases') or [])
+            item['aliases'] = sorted({_normalized_alias(value) for value in aliases if value})
+            result.append(item)
     return result
 
 
@@ -165,6 +182,31 @@ def get_selected(group_id, user_id):
     return (item, None) if item else (None, '所选服务器已不在允许清单')
 
 
+def get_group_default(group_id):
+    """Return a configured per-group default without persisting user state.
+
+    ``SCE_SERVER_GROUP_DEFAULTS`` uses ``group_id:server_id`` pairs separated
+    by commas.  A missing or invalid mapping is intentionally treated as no
+    default, so an old group can never silently fall through to a new server.
+    """
+    wanted = str(group_id or '').strip()
+    if not wanted:
+        return None, '未配置群默认服务器'
+    mapping = {}
+    for pair in os.environ.get(GROUP_DEFAULTS_ENV, '').split(','):
+        if ':' not in pair:
+            continue
+        key, value = pair.split(':', 1)
+        key, value = key.strip(), value.strip().casefold()
+        if key and value:
+            mapping[key] = value
+    server_id = mapping.get(wanted)
+    if not server_id:
+        return None, '未配置群默认服务器'
+    item = load_servers().get(server_id)
+    return (item, None) if item else (None, '群默认服务器不在允许清单')
+
+
 def clear_selected(group_id, user_id):
     """Clear a saved operation target; return whether one existed."""
     key = (str(group_id), str(user_id))
@@ -188,6 +230,22 @@ def _read_password(server):
 def query_server(server, command):
     if not server:
         raise ValueError('未指定服务器')
+    if str(server.get('kind') or '').strip().casefold() == 'status':
+        command_text = re.sub(r'\s+', ' ', str(command or '').strip()).casefold()
+        if command_text not in {'list', 'status', 'online', 'version'}:
+            raise StatusOnlyError(
+                '该服务器仅提供在线状态探测，未配置 RCON；TPS、聊天和管理命令暂不可用')
+        try:
+            from minecraft_status import query as status_query, to_list_output, to_version_output
+            status = status_query(server.get('host'), server.get('port'),
+                                  timeout=server.get('status_timeout', 5))
+        except StatusOnlyError:
+            raise
+        except Exception as exc:
+            raise StatusOnlyError(f'状态探测失败：{exc}') from exc
+        if command_text == 'version':
+            return to_version_output(status)
+        return to_list_output(status)
     password = _read_password(server)
     try:
         with RconClient(server.get('host', '127.0.0.1'), int(server['port']), password) as client:
@@ -231,6 +289,7 @@ def extract_natural_server_selector(text):
     patterns = (
         (resolve_server('legacy'), re.compile(r'(?i)(?:SCEX\s*Legacy\s*Genesis|Legacy\s*Genesis|怀旧(?:服|服务器))')),
         (resolve_server('nast'), re.compile(r'(?i)(?<![A-Za-z0-9_])NAST(?:服|服务器)?(?![A-Za-z0-9_])')),
+        (resolve_server('mystic'), re.compile(r'(?i)(?:神秘时代(?:社区|4高版本移植)?(?:服|服务器)?|mystic(?:服|server)?)')),
     )
     found = []
     for item, pattern in patterns:
@@ -259,6 +318,8 @@ def fanout_group_message(nickname, text, servers=None, query_fn=None):
         return []
     results = []
     for server in servers:
+        if server.get('chat_enabled', True) is False:
+            continue
         command = f'say [QQ群] {nick}: {content}'
         try:
             query_fn(server, command)

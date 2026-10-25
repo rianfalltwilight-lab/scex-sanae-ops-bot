@@ -29,3 +29,12 @@ public design ideas from:
 This project does not include that repository's DeepSeek Harness agent runtime or copy
 its packaged dependencies. See `AI-GENERATED.md` for the development provenance.
 
+
+The optional `!ping` / `!ping full` network diagnosis is a Python adaptation of
+`tools/QQConsoleBridge.java` at the same pinned upstream revision.
+Required Notice: Copyright (c) 2026 i0czf
+(https://github.com/i0czf/minecraft-server-ops-kit).
+The upstream license for this adaptation is preserved in `LICENSE.network-ping`.
+Local changes bound deadlines and subprocess cleanup, keep command routing
+nonblocking, and use generated upload data. Reference-node latency is not a
+measurement of an individual player's entire connection.

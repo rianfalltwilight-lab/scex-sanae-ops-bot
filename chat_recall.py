@@ -1,6 +1,7 @@
 """Read bounded, group-scoped chat evidence; never derive people from topic memory."""
 from __future__ import annotations
 import json
+from onebot_utf8 import onebot_headers
 import re
 import time
 import urllib.request
@@ -8,6 +9,7 @@ import html
 import context_policy as limits
 from request_runtime import remaining_timeout
 from datetime import datetime, timedelta, timezone
+from sanae_identity import SANAE_QQ, HISTORICAL_BOT_QQ, BOT_NAME_PATTERN
 
 TZ = timezone(timedelta(hours=8))
 MAX_BODY = 2*1024*1024
@@ -15,7 +17,7 @@ MAX_BODY = 2*1024*1024
 
 def clean(text):
     text = re.sub(r'\[CQ:[^\]]*\]', '', str(text or ''))
-    text = re.sub(r'^\s*(?:@東風谷\s*早苗|@早苗|早苗|[!！]\s*问)[\s，,：:]*', '', text)
+    text = re.sub(r'^\s*(?:@?' + BOT_NAME_PATTERN + r'|[!！]\s*问)[\s，,：:]*', '', text, flags=re.I)
     return text.strip()
 
 
@@ -28,10 +30,15 @@ def is_recall(text):
     text = clean(raw)
     group = re.search(r'(群内|群里|本群|群聊|大家|群友|聊天记录|发言记录)', text)
     action = re.search(r'(分析|总结|简短|简版|短版|精简|概括|梳理|复盘|回顾|统计|盘点|常见|常说|聊了|聊什么|说过|说了|提过|发过|次数|最多|多少)', text)
-    personal = re.search(r'(我|本人|自己).{0,24}(说|提|发言|讲|刷屏).{0,20}(多|几次|多少|频繁|次数|常)', text)
-    frequent = re.search(r'(我|本人|自己).{0,10}(经常|常常|总是|频繁).{0,12}(说|提|发言|讲|刷屏)', text)
+    # A later clause can have another speaker: "我改了，同事说好多了"
+    # is feedback, not a count of the current user's past utterances.
+    # Keep subject and speech verb together; a count question may follow a comma.
+    same_clause = r'[^，,。.!！?？;；\r\n]'
+    personal = re.search(r'(我|本人|自己)' + same_clause + r'{0,24}(说|提|发言|讲|刷屏).{0,20}(多|几次|多少|频繁|次数|常)', text)
+    frequent = re.search(r'(我|本人|自己)' + same_clause + r'{0,10}(经常|常常|总是|频繁)' + same_clause + r'{0,12}(说|提|发言|讲|刷屏)', text)
+    recent = re.search(r'我(?:最近|平时|经常|常常)' + same_clause + r'{0,8}(说|发|聊).{0,6}(什么|啥)', text)
     # Keep the detector about past utterances, not hypothetical game actions.
-    return bool((group and action) or personal or frequent or re.search(r'我(?:最近|平时|经常|常常).{0,8}(说|发|聊).{0,6}(什么|啥)', text))
+    return bool((group and action) or personal or frequent or recent)
 
 
 def is_analysis_request(text):
@@ -65,7 +72,7 @@ def personal_keyword(text):
 def read_api(api, action, payload, timeout=10):
     request = urllib.request.Request(api.rstrip('/')+'/'+action,
         data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type':'application/json; charset=utf-8'},method='POST')
+        headers=onebot_headers(),method='POST')
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read(MAX_BODY+1)
     if len(body) > MAX_BODY:
@@ -76,60 +83,109 @@ def read_api(api, action, payload, timeout=10):
     return result.get('data')
 
 
-def fetch_rows(api, group_id, timeout=30):
-    """Walk older OneBot pages; repeated/inclusive cursors must not loop."""
-    deadline, cursor, seen, rows = time.monotonic() + timeout, 0, set(), []
+def fetch_rows(api, group_id, timeout=30, *, before_seq=None, diagnostics=None, api_reader=None,
+               max_rows=None):
+    """Walk bounded older pages. Optional diagnostics do not claim complete history."""
+    reader = read_api if api_reader is None else api_reader
+    if max_rows is not None and (type(max_rows) is not int or max_rows < 1):
+        raise ValueError('invalid history row limit')
+    row_limit = limits.CHAT_ROWS if max_rows is None else min(max_rows, limits.CHAT_ROWS)
+    cursor = 0 if before_seq is None else int(before_seq)
+    if isinstance(before_seq, bool) or cursor < 0:
+        raise ValueError('invalid history cursor')
+    info = diagnostics if diagnostics is not None else {}
+    info.update(pages=0, failures=0, rows=0, cursor_start=cursor,
+                cursor_next=cursor, stop_reason='page_limit', truncated=True)
+    deadline, seen, rows = time.monotonic() + timeout, set(), []
     for _ in range(10):
         left = deadline - time.monotonic()
         if left <= 0:
+            info['stop_reason'] = 'time_limit'
             break
         try:
-            data = read_api(api, 'get_group_msg_history',
-                            dict(group_id=int(group_id), message_seq=cursor, count=100),
-                            min(left, remaining_timeout(10)))
+            data = reader(api, 'get_group_msg_history',
+                          dict(group_id=int(group_id), message_seq=cursor, count=100),
+                          min(left, remaining_timeout(10)))
+            info['pages'] += 1
+            page = data.get('messages') if isinstance(data, dict) else data
+            if not isinstance(page, list):
+                raise ValueError('invalid chat history')
         except Exception:
+            info['failures'] += 1
+            info['stop_reason'] = 'page_failed'
             if not rows:
                 raise
             break
-        page = data.get('messages') if isinstance(data, dict) else data
-        if not isinstance(page, list):
-            raise ValueError('invalid chat history')
+        if not page:
+            info.update(stop_reason='empty_page', truncated=False)
+            break
         added, seqs = 0, []
         for row in page:
             if not isinstance(row, dict) or str(row.get('group_id', group_id)) != str(group_id):
                 continue
             seq = row.get('message_seq') or row.get('real_id')
             try:
-                if int(seq) > 0:
-                    seqs.append(int(seq))
-            except (TypeError, ValueError):
-                pass
+                sequence = int(seq)
+            except (TypeError, ValueError, OverflowError):
+                sequence = 0
+            # Providers may include the cursor itself. Treat before_seq as exclusive.
+            if cursor and sequence > 0 and sequence >= cursor:
+                continue
+            if sequence > 0:
+                seqs.append(sequence)
             key = str(row.get('message_id') or seq or json.dumps(row, sort_keys=True, ensure_ascii=False))
             if key not in seen:
                 seen.add(key)
                 rows.append(row)
                 added += 1
-        if not added or not seqs or len(rows) >= limits.CHAT_ROWS:
+                if len(rows) >= limits.CHAT_ROWS:
+                    break
+        info['rows'] = len(rows)
+        if seqs:
+            info['cursor_next'] = min(seqs)
+        if len(rows) >= row_limit:
+            info['stop_reason'] = 'row_limit'
+            break
+        if not added or not seqs:
+            info['stop_reason'] = 'no_older_cursor' if not seqs else 'repeated_page'
             break
         next_cursor = min(seqs)
         if cursor and next_cursor >= cursor:
+            info['stop_reason'] = 'repeated_cursor'
             break
         cursor = next_cursor
-    return sorted(rows, key=lambda r: r.get('time') or 0)[-limits.CHAT_ROWS:]
+        info['cursor_next'] = cursor
+    def order(row):
+        try:
+            sequence = int(row.get('message_seq') or row.get('real_id') or 0)
+        except (TypeError, ValueError, OverflowError):
+            sequence = 0
+        return (row.get('time') or 0, sequence)
+    # Read the complete bounded page before taking its newest rows; providers
+    # can return either page order and several messages may share one second.
+    key = (lambda row: row.get('time') or 0) if max_rows is None else order
+    return sorted(rows, key=key)[-row_limit:]
 
 
-def expand_forward(api, forward_id):
+def expand_forward(api, forward_id, *, api_reader=None, diagnostics=None):
     """Flatten nested forwards with shared limits; preserve each original speaker."""
+    reader = read_api if api_reader is None else api_reader
     seen, lines = set(), []
-    state = dict(calls=0, rows=0, chars=0, readable=0, failures=0, truncated=False)
+    state = dict(calls=0, rows=0, chars=0, readable=0, failures=0, truncated=False, visited_nodes=0)
     deadline = time.monotonic() + limits.READ_SECONDS
 
-    def add(name, text):
+    def add(name, text, stamp=None):
         text = re.sub(r'\s+', ' ', str(text)).strip()
         if not text:
             return
         text = limits.clip(text, limits.QUESTION_CHARS)
-        line = json.dumps({'说话人': str(name)[:60], '内容': text}, ensure_ascii=False)
+        record = {'说话人': str(name)[:60], '内容': text}
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            try:
+                record['时间'] = datetime.fromtimestamp(stamp, TZ).isoformat()
+            except (ValueError, OverflowError, OSError):
+                pass
+        line = json.dumps(record, ensure_ascii=False)
         if state['rows'] >= limits.CHAT_ROWS or state['chars'] + len(line) > limits.SOURCE_CHARS - 500:
             state['truncated'] = True
             return
@@ -148,7 +204,7 @@ def expand_forward(api, forward_id):
         seen.add(identifier)
         state['calls'] += 1
         try:
-            data = read_api(api, 'get_forward_msg', {'id': identifier},
+            data = reader(api, 'get_forward_msg', {'id': identifier},
                             min(deadline-time.monotonic(), remaining_timeout(10)))
             nodes = data.get('messages') if isinstance(data, dict) else data
             if not isinstance(nodes, list):
@@ -157,11 +213,15 @@ def expand_forward(api, forward_id):
             state['failures'] += 1
             return
         for item in nodes:
-            if state['truncated']:
+            if state['truncated'] or state['visited_nodes'] >= limits.CHAT_ROWS:
+                state['truncated'] = True
                 break
+            state['visited_nodes'] += 1
             if not isinstance(item, dict):
                 continue
             sender = item.get('sender') or {}
+            sender = sender if isinstance(sender, dict) else {}
+            stamp = item.get('time')
             name = sender.get('card') or sender.get('nickname') or item.get('nickname') or '群友'
             content = item.get('message', item.get('content', item.get('raw_message', '')))
             if isinstance(content, str):
@@ -181,8 +241,9 @@ def expand_forward(api, forward_id):
                 if not isinstance(segment, dict):
                     continue
                 kind, values = segment.get('type'), segment.get('data') or {}
+                values = values if isinstance(values, dict) else {}
                 if kind == 'forward':
-                    add(name, ''.join(parts)); parts = []
+                    add(name, ''.join(parts), stamp); parts = []
                     ident = values.get('id') or values.get('res_id')
                     if ident:
                         walk(str(ident), depth+1)
@@ -193,8 +254,10 @@ def expand_forward(api, forward_id):
                 else:
                     parts.append({'image': '[图片]', 'record': '[语音]', 'video': '[视频]',
                                   'file': '[文件]'}.get(kind, '[内容未读取]'))
-            add(name, ''.join(parts))
+            add(name, ''.join(parts), stamp)
     walk(str(forward_id), 0)
+    if diagnostics is not None:
+        diagnostics.update(state)
     scope = ('引用转发可读消息{}条；展开{}份转发；失败{}份；{}；图片/音视频内容未读取，'
              '转发者不等于原发言人，不代表完整原群历史').format(
                  state['rows'], state['calls'], state['failures'],
@@ -204,7 +267,7 @@ def expand_forward(api, forward_id):
     return '[合并转发]\n' + scope + '\n' + '\n'.join(lines)
 
 
-def evidence(rows, group_id, user_id, query, self_id='0', now=None):
+def evidence(rows, group_id, user_id, query, self_id=SANAE_QQ, now=None):
     now = time.time() if now is None else now
     normalized = []
     seen = set()
@@ -213,7 +276,8 @@ def evidence(rows, group_id, user_id, query, self_id='0', now=None):
             continue
         uid = str(row.get('user_id') or (row.get('sender') or {}).get('user_id') or '')
         stamp = row.get('time')
-        if not uid or uid == str(self_id) or not isinstance(stamp,(int,float)) or not 0 < stamp <= now+60:
+        if (not uid or uid in HISTORICAL_BOT_QQ or uid == str(self_id)
+                or not isinstance(stamp,(int,float)) or not 0 < stamp <= now+60):
             continue
         message = row.get('message')
         if isinstance(message,list):

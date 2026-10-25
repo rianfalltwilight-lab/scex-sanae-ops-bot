@@ -1,0 +1,26 @@
+name: Sanae offline regression
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+  SCE_BOT_TEST_MODE: '1'
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ['3.11', '3.12']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install declared test dependency
+        run: python -m pip install -r requirements.txt
+      - name: Run isolated offline tests
+        run: python scripts/test-offline.py

@@ -27,12 +27,13 @@ class _Response:
 
 class SocialLiteTests(unittest.TestCase):
     def make(self, **kwargs):
-        # The production workspace is writable in the Windows service account;
-        # use it for the fixture because this runner may deny %TEMP% writes.
-        root = Path(tempfile.mkdtemp(prefix='social-lite-', dir=str(Path(__file__).resolve().parents[1])))
+        # Keep synthetic fixture files in this public checkout and remove them.
+        temp = tempfile.TemporaryDirectory(prefix='social-lite-', dir=str(Path(__file__).resolve().parents[1]))
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
         return SocialLite(root / 'state.json', root / 'activity.log', **kwargs)
 
-    def event(self, text='今天天气怎么样？', uid='10001'):
+    def event(self, text='今天天气怎么样？', uid='2001'):
         return {
             'post_type': 'message', 'message_type': 'group', 'group_id': 1001,
             'user_id': uid, 'self_id': '1002', 'raw_message': text,
@@ -49,7 +50,7 @@ class SocialLiteTests(unittest.TestCase):
             social.record_incoming(event)
             social.record_outgoing(event['group_id'], '收到啦')
             self.assertGreaterEqual(save.call_count, 2)
-        ok, reason = social.should_reply(self.event('还有别的吗？', '10002'))
+        ok, reason = social.should_reply(self.event('还有别的吗？', '2002'))
         self.assertFalse(ok)
         self.assertEqual(reason, 'cooldown')
         status = social.status(event['group_id'])
@@ -77,7 +78,7 @@ class SocialLiteTests(unittest.TestCase):
 
         with mock.patch.object(social, '_save'):
             self.assertTrue(social.maybe_schedule(self.event('第一条？'), callback, 0.1)[0])
-            self.assertTrue(social.maybe_schedule(self.event('第二条？', '10002'), callback, 0.1)[0])
+            self.assertTrue(social.maybe_schedule(self.event('第二条？', '2002'), callback, 0.1)[0])
         self.assertTrue(done.wait(2))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], '第二条？')
@@ -109,10 +110,10 @@ class SocialLiteTests(unittest.TestCase):
             return _Response({'status': 'ok', 'retcode': 0, 'data': None})
 
         with mock.patch('social_lite.urllib.request.urlopen', fake_open):
-            actions.mute(1001, 1004, 300)
+            actions.mute(1001, 2001, 300)
         self.assertTrue(seen['url'].endswith('/set_group_ban'))
         self.assertEqual(seen['body'], {
-            'group_id': 1001, 'user_id': 1004, 'duration': 300})
+            'group_id': 1001, 'user_id': 2001, 'duration': 300})
 
     def test_expression_style_hint_is_derived_and_decisional(self):
         social = self.make()
@@ -131,7 +132,8 @@ class SocialLiteTests(unittest.TestCase):
         self.assertEqual('', social.expression_style_hint(1001, self.event('早苗')))
 
     def test_multiline_reply_is_split_for_transport_with_safe_bounds(self):
-        self.assertEqual(['当', '然', '可', '以'], split_social_reply('当\n然\n可\n以'))
+        self.assertEqual(['当\n然\n可\n以'], split_social_reply('当\n然\n可\n以'))
+        self.assertEqual(['终于改完了', '第一版赢了'], split_social_reply('终于改完了\n第一版赢了'))
         self.assertEqual(['这是一句正常的完整回复。'], split_social_reply('这是一句正常的完整回复。'))
         self.assertEqual(['a\nb\nc\nd\ne\nf\ng'], split_social_reply('a\nb\nc\nd\ne\nf\ng'))
 

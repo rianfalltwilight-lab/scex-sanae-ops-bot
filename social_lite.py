@@ -19,7 +19,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from onebot_utf8 import JSON_CONTENT_TYPE, json_bytes, utf8_text
+from onebot_utf8 import JSON_CONTENT_TYPE, json_bytes, utf8_text, onebot_headers
+from sanae_identity import SANAE_QQ, HISTORICAL_BOT_QQ, BOT_NAME, BOT_NAME_PATTERN
 
 
 _CQ_RE = re.compile(r"\[CQ:[^\]]*\]", re.I)
@@ -28,9 +29,13 @@ _FOLLOWUP_RE = re.compile(r"^(?:继续|接着|然后呢|说话|你呢|怎么说|
 _RELATED_RE = re.compile(r"服务器|服务端|整合包|模组|插件|玩家|在线|掉线|卡顿|卡死|延迟|TPS|炸服|崩溃|进度|成就|截图|蓝图|RCON|传送|效果|配方|矿|维度", re.I)
 _COMMAND_RE = re.compile(r"^\s*[!！/]" )
 _NOISE_RE = re.compile(r"^(?:嗯|哦|啊|哈哈|笑死|草|好|行|ok|好的|收到)[!！。\. ]*$", re.I)
+_CLOSING_PART_RE = re.compile(
+    r"(?:我)?(?:先)?(?:睡了|去睡了|去睡觉了|睡觉去了|去睡觉|下了|下线了|走了|撤了|去忙了|忙去了|忙了|不聊了)"
+    r"|(?:我)?(?:要睡了|要去睡了|先忙|先走一步|先忙一会儿?|先忙一下)"
+    r"|晚安|大家晚安|回头聊|下次聊|明天聊|再见|拜拜|拜|拜了", re.I)
 
 
-def split_social_reply(text: Any, max_lines: int = 6, max_chars: int = 120) -> list[str]:
+def split_social_reply(text: Any, max_lines: int = 8, max_chars: int = 80) -> list[str]:
     """Split a model-chosen multiline social reply into bounded QQ messages.
 
     Newlines are treated as the model's decision to mirror a segmented cadence;
@@ -42,23 +47,131 @@ def split_social_reply(text: Any, max_lines: int = 6, max_chars: int = 120) -> l
         return []
     lines = [re.sub(r"\s+$", "", line).strip()
              for line in re.split(r"\r?\n+", value) if line.strip()]
-    if 2 <= len(lines) <= max(1, int(max_lines)) and all(len(line) <= max_chars for line in lines):
+    if (2 <= len(lines) <= min(8, max(1, int(max_lines)))
+            and sum(map(len, lines)) <= 120
+            and all(len(line) <= max_chars for line in lines)
+            and not (len(lines) > 2 and all(len(line) == 1 for line in lines))
+            and not re.search(r'\n[ \t]+\S', value)
+            and not re.search(r'```|(?m:^\s*(?:\d+[.)、]|[-*]\s))', value)):
         return lines
     return [value]
+
+
+def split_informative_reply(text: Any, max_parts: int = 8, target_chars: int = 300,
+                            max_chars: int = 3500) -> list[str]:
+    """Keep a sourced answer intact while grouping it into readable bubbles.
+
+    Prefer paragraph boundaries, then complete sentences.  Technical tokens
+    and fenced code stay together; an answer that cannot fit safely falls back
+    to the original text so the caller can use its existing folding path.
+    This changes boundary whitespace only, never the answer's wording.
+    """
+    value = str(text or "").strip()
+    if not value:
+        return []
+    limit = min(8, max(1, int(max_parts)))
+    maximum = min(3500, max(1, int(max_chars)))
+    target = min(maximum, max(1, int(target_chars)))
+    if limit == 1 or len(value) > limit * maximum:
+        return [value]
+
+    protected: list[tuple[int, int]] = []
+    fence_start: int | None = None
+    fence_mark = ""
+    for line in re.finditer(r"[^\n]*(?:\n|$)", value):
+        marker = re.match(r"[ \t]*(`{3,}|~{3,})", line.group())
+        if marker:
+            mark = marker.group(1)
+            if fence_start is None:
+                fence_start, fence_mark = line.start(), mark
+            elif mark[0] == fence_mark[0] and len(mark) >= len(fence_mark):
+                # A fence closer has no language or other trailing text.
+                if not line.group()[marker.end():].strip():
+                    protected.append((fence_start, line.end()))
+                    fence_start = None
+    if fence_start is not None:
+        protected.append((fence_start, len(value)))
+
+    # These are conservative spans, not a Markdown renderer.  Keeping an
+    # ambiguous technical span whole is preferable to cutting its contents.
+    token_patterns = (
+        r"(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)",
+        r"!?\[[^\]\n]*\]\([^\n]*?\)",
+        r"!?\[[^\]\n]*\]\[[^\]\n]*\]",
+        r"(?:https?://|ftp://|www\.)[^\s<>]+",
+        r"\[CQ:[^\]]*\]",
+        r"(?m)^[ \t]*(?:[$>#] +|PS [^\n>]*> |(?:python(?:3)?|pip(?:3)?|"
+        r"pwsh|powershell|git|curl|wget|npm|pnpm|yarn|node|java|docker|ssh|"
+        r"cd|Get-\w+|Set-\w+|Invoke-\w+)\b)[^\n]*",
+        r"(?m)^(?: {4}|\t)[^\n]*(?:\n(?: {4}|\t)[^\n]*)*",
+    )
+    for pattern in token_patterns:
+        for match in re.finditer(pattern, value, re.I):
+            begin, end = match.span()
+            # A shell continuation is still the same command, even without
+            # a Markdown fence.  Never turn its second line into a new bubble.
+            if pattern.startswith(r"(?m)^[ \t]*"):
+                while value[begin:end].rstrip().endswith(("\\", "`", "|", "&&")) and end < len(value):
+                    next_end = value.find("\n", end + 1)
+                    end = len(value) if next_end < 0 else next_end
+            protected.append((begin, end))
+
+    def safe(position: int) -> bool:
+        return not any(start < position < end for start, end in protected)
+
+    paragraphs = {match.end() for match in re.finditer(r"\n+", value)
+                  if safe(match.end())}
+    sentences = {match.end() for match in re.finditer(
+        r"(?:[。！？!?]|\.(?=\s|$))[\"'”’」』）)]*", value)
+                 if safe(match.end())}
+    boundaries = sorted(paragraphs | sentences | {len(value)})
+    result: list[str] = []
+    start = 0
+    while start < len(value):
+        remaining, slots = len(value) - start, limit - len(result)
+        desired = max(target, (remaining + slots - 1) // slots)
+        if remaining <= min(maximum, desired * 5 // 4) or slots == 1:
+            if remaining > maximum:
+                return [value]
+            result.append(value[start:].strip())
+            break
+        available = [end for end in boundaries if start < end <= start + maximum]
+        if not available:
+            return [value]
+        nearby = [end for end in available
+                  if desired // 2 <= end - start <= desired * 5 // 4
+                  and (end == len(value) or len(value) - end >= target // 2)]
+        paragraph_choices = [end for end in nearby if end in paragraphs]
+        choices = paragraph_choices or nearby
+        if choices:
+            end = min(choices, key=lambda pos: abs(pos - start - desired))
+        else:
+            end = next((pos for pos in available if pos - start >= desired), available[-1])
+        part = value[start:end].strip()
+        if part:
+            result.append(part)
+        start = end
+        while start < len(value) and value[start].isspace():
+            start += 1
+    return result or [value]
 
 
 class SocialLite:
     """Bounded, file-backed group state and local reply gate."""
 
     PHASES = {"watching", "active", "cooldown", "sleeping"}
+    CLOSING_TTL_SECONDS = 6 * 60 * 60
+    MAX_CLOSING_USERS = 64
 
     def __init__(self, state_path: str | os.PathLike[str], activity_path: str | os.PathLike[str],
-                 self_id: str = "0", max_recent: int = 30,
+                 self_id: str = SANAE_QQ, max_recent: int = 30,
                  cooldown_seconds: float = 12.0, spontaneous_probability: float = 0.0,
                  ambient_reply_weight: float = 1.0):
         self.state_path = Path(state_path)
         self.activity_path = Path(activity_path)
         self.self_id = str(self_id)
+        self._at_self_re = re.compile(r"\[CQ:at,qq=" + re.escape(self.self_id)
+                                      + r"(?:,[^\]]*)?\]", re.I)
         self.max_recent = max(5, int(max_recent))
         self.cooldown_seconds = max(1.0, float(cooldown_seconds))
         self.spontaneous_probability = min(1.0, max(0.0, float(spontaneous_probability)))
@@ -101,7 +214,107 @@ class SocialLite:
             group["recent"] = []
         if not isinstance(group.get("topics"), list):
             group["topics"] = []
+        if not isinstance(group.get("closing"), dict):
+            group["closing"] = {}
         return group
+
+    @classmethod
+    def _is_closing_text(cls, raw: Any) -> bool:
+        # Match the speaker's short farewell, not reported speech, questions,
+        # negations or a farewell followed by a request to keep chatting.
+        text = cls._clean_text(raw)
+        text = re.sub(r"^(?:" + BOT_NAME_PATTERN + r")[，,：:、\s]+", "", text, flags=re.I)
+        if not text or len(text) > 60 or re.search(r"[?？\"'“”‘’「」『』]", text):
+            return False
+        parts = [p.strip() for p in re.split(r"[，,。.!！；;、~～\s]+", text) if p.strip()]
+        return bool(parts and all(_CLOSING_PART_RE.fullmatch(p) for p in parts))
+
+    @staticmethod
+    def _closing_source_key(event: dict[str, Any]) -> str:
+        message_id = str(event.get("message_id") or "")
+        if message_id:
+            return "message:" + message_id
+        raw = str(event.get("raw_message") or event.get("message") or "")
+        value = f"{event.get('time') or ''}:{raw}"
+        return "event:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _prune_closing(self, group: dict[str, Any], now: float) -> bool:
+        closed = group["closing"]
+        expired = [uid for uid, entry in closed.items()
+                   if not isinstance(entry, dict) or float(entry.get("expiresAt") or 0) <= now]
+        for uid in expired:
+            closed.pop(uid, None)
+        return bool(expired)
+
+    def observe_closing(self, event: dict[str, Any]) -> None:
+        """Observe every human group message, including media-only messages.
+
+        Repeated observation of the same event is harmless.  This is separate
+        from recent excerpts so the bridge can observe unaddressed messages
+        without appending them twice or making them eligible for a reply.
+        """
+        gid, uid = event.get("group_id"), str(event.get("user_id") or "")
+        if gid is None or not uid or uid == self.self_id:
+            return
+        raw = event.get("raw_message") or event.get("message") or ""
+        if not raw:
+            return
+        now, source_key = time.time(), self._closing_source_key(event)
+        with self._lock:
+            group = self._group(gid)
+            changed = self._prune_closing(group, now)
+            closed = group["closing"]
+            current = closed.get(uid)
+            if self._is_closing_text(raw):
+                if not current or current.get("sourceKey") != source_key:
+                    closed[uid] = {"at": now, "expiresAt": now + self.CLOSING_TTL_SECONDS,
+                                   "sourceKey": source_key}
+                    changed = True
+                if len(closed) > self.MAX_CLOSING_USERS:
+                    oldest = min(closed, key=lambda key: float(closed[key].get("at") or 0))
+                    closed.pop(oldest, None)
+            elif current:
+                closed.pop(uid, None)
+                changed = True
+            if changed:
+                self._save()
+
+    def closing_hint(self, event: dict[str, Any]) -> str:
+        """Give reply context a bounded, per-person conversation-ending hint."""
+        gid, uid = event.get("group_id"), str(event.get("user_id") or "")
+        if gid is None:
+            return ""
+        with self._lock:
+            group = self._group(gid)
+            if self._prune_closing(group, time.time()):
+                self._save()
+            closed = dict(group["closing"])
+        notes = []
+        current = closed.get(uid)
+        if current and current.get("sourceKey") == self._closing_source_key(event):
+            notes.append("当前说话人已明确收尾。若这轮需要回应，用一句自然短答收住；"
+                         "保留八千代的语气，可以轻轻吐槽，但别追加问题、建议清单或催办，"
+                         "不承诺稍后主动提醒。")
+        others = [key for key in closed if key != uid]
+        if others:
+            notes.append("本群暂已收尾的用户：" + "、".join(others) +
+                         "。这轮不要主动点名这些人续聊、追问或催办；其他人的交谈正常继续。"
+                         "他们自己再次发言会重新开启对话。")
+        return ("〖对话收尾状态〗" + "".join(notes)) if notes else ""
+
+    def retract(self, group_id: Any, message_id: Any) -> None:
+        """Remove only closing state sourced from a recalled message."""
+        source_key = "message:" + str(message_id or "")
+        if group_id is None or not message_id:
+            return
+        with self._lock:
+            group = self._group(group_id)
+            matches = [uid for uid, entry in group["closing"].items()
+                       if isinstance(entry, dict) and entry.get("sourceKey") == source_key]
+            for uid in matches:
+                group["closing"].pop(uid, None)
+            if matches:
+                self._save()
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,6 +336,7 @@ class SocialLite:
             pass
 
     def record_incoming(self, event: dict[str, Any]) -> None:
+        self.observe_closing(event)
         gid = event.get("group_id")
         if gid is None:
             return
@@ -134,6 +348,10 @@ class SocialLite:
         item = {
             "sender": str(sender.get("card") or sender.get("nickname") or event.get("user_id") or "?"),
             "userId": str(event.get("user_id") or ""),
+            "messageId": str(event.get("message_id") or ""),
+            "replyId": next((str((x.get('data') or {}).get('id') or '')
+                             for x in (event.get('message') or [])
+                             if isinstance(x, dict) and x.get('type') == 'reply'), ''),
             "text": text[:240], "time": time.time(),
             "lineBreaks": min(12, original.count("\n")),
             "isSelf": str(event.get("user_id") or "") == self.self_id,
@@ -145,10 +363,13 @@ class SocialLite:
             group["recent"] = group["recent"][-self.max_recent:]
             self._save()
 
-    def record_outgoing(self, group_id: Any, text: str, action: str = "reply") -> None:
+    def record_outgoing(self, group_id: Any, text: str, action: str = "reply",
+                        reply_to_user_id: Any = None) -> None:
         now = time.time()
-        item = {"sender": "早苗", "userId": self.self_id, "text": self._clean_text(text)[:240],
+        item = {"sender": BOT_NAME, "userId": self.self_id, "text": self._clean_text(text)[:240],
                 "time": now, "isSelf": True, "action": action}
+        if reply_to_user_id is not None:
+            item["replyToUserId"] = str(reply_to_user_id)
         with self._lock:
             group = self._group(group_id)
             group["lastReplyAt"] = now
@@ -159,6 +380,26 @@ class SocialLite:
             self._save()
         self._activity(f"group:{group_id} outgoing[{action}]: {item['text']}")
 
+    def forget_recent(self, group_id, user_id=None, clear_closing=True):
+        """Drop group excerpts including bot echoes after a forget or recall."""
+        gid = str(group_id)
+        with self._lock:
+            group = self._group(gid)
+            group['recent'] = []
+            # Recent excerpts are shared group context; explicit per-person
+            # forgetting must not reopen everybody else's finished exchange.
+            # A recall already removes only its source via retract().
+            if clear_closing:
+                if user_id is None:
+                    group['closing'] = {}
+                else:
+                    group['closing'].pop(str(user_id), None)
+            self._pending.pop(gid, None)
+            timer = self._timers.pop(gid, None)
+            if timer:
+                timer.cancel()
+            self._save()
+
     def _score(self, event: dict[str, Any], group: dict[str, Any]) -> tuple[int, str]:
         raw = str(event.get("raw_message") or event.get("message") or "")
         text = self._clean_text(raw)
@@ -168,11 +409,26 @@ class SocialLite:
             return 0, "self"
         score = 0
         reasons: list[str] = []
-        if re.search(r"\[CQ:at,qq=" + re.escape(self.self_id) + r"(?:,[^\]]*)?\]", raw, re.I) or "早苗" in text:
+        if self._at_self_re.search(raw) or re.search(BOT_NAME_PATTERN, text, re.I):
             score += 5; reasons.append("direct")
         reply = event.get("reply")
         if isinstance(reply, dict) and str(reply.get("user_id") or "") == self.self_id:
             score += 4; reasons.append("reply")
+        if self._is_closing_text(raw):
+            # Let a person end their own recent exchange without having to @
+            # again; a farewell elsewhere in a busy group is not a summons.
+            recent = group.get("recent") or []
+            for index in range(len(recent) - 1, -1, -1):
+                item = recent[index]
+                if item.get("isSelf"):
+                    # Generation is asynchronous: the last human before a reply
+                    # can be a bystander. Only the originating event owns it;
+                    # older records without a recipient are deliberately ignored.
+                    if (0 <= time.time() - float(item.get("time") or 0) <= 90
+                            and item.get("replyToUserId")
+                            and str(item["replyToUserId"]) == str(event.get("user_id") or "")):
+                        score += 3; reasons.append("closing")
+                    break
         if _QUESTION_RE.search(text):
             score += 2; reasons.append("question")
         # 短促追问只有在早苗刚回复过时才触发，避免把普通“继续/说话”刷成 AI 回复。
@@ -191,7 +447,7 @@ class SocialLite:
             seed = f"{event.get('time') or time.time()}:{event.get('user_id')}:{text}"
             sample = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
             if sample < self.spontaneous_probability:
-                score = 1; reasons.append("spontaneous")
+                score = 2; reasons.append("spontaneous")
         return score, "+".join(reasons) or "ordinary"
 
     def should_reply(self, event: dict[str, Any]) -> tuple[bool, str]:
@@ -204,12 +460,12 @@ class SocialLite:
             now = time.time()
             last = float(group.get("lastReplyAt") or 0)
             if (now - last < self.cooldown_seconds and
-                    not any(tag in reason for tag in ("direct", "reply", "followup"))):
+                    not any(tag in reason for tag in ("direct", "reply", "followup", "closing"))):
                 return False, "cooldown"
             if "related" in reason and now - last < max(30.0, self.cooldown_seconds):
                 return False, "related-cooldown"
-            explicit = any(tag in reason for tag in ("direct", "reply", "followup"))
-            if score >= 2 and not explicit and self.ambient_reply_weight < 1.0:
+            explicit = any(tag in reason for tag in ("direct", "reply", "followup", "closing"))
+            if score >= 2 and not explicit and "spontaneous" not in reason and self.ambient_reply_weight < 1.0:
                 # Stable per-message sampling keeps the tenfold reduction
                 # deterministic for a given event and avoids a global RNG.
                 raw = str(event.get("raw_message") or event.get("message") or "")
@@ -219,13 +475,37 @@ class SocialLite:
                     return False, "ambient-weight"
             return score >= 2, reason
 
+    def is_explicit_interaction(self, event: dict[str, Any]) -> bool:
+        raw = str(event.get('raw_message') or event.get('message') or '')
+        text = self._clean_text(raw)
+        if self._at_self_re.search(raw) or re.match(BOT_NAME_PATTERN, text, re.I):
+            return True
+        reply = event.get('reply')
+        if isinstance(reply, dict) and str(reply.get('user_id') or '') == self.self_id:
+            return True
+        with self._lock:
+            group = self._group(event.get('group_id'))
+            last = float(group.get('lastReplyAt') or 0)
+        return bool(_FOLLOWUP_RE.match(text) and last and time.time() - last <= 90)
+
     def _context(self, gid: Any, pending: list[dict[str, Any]]) -> str:
         with self._lock:
             group = self._group(gid)
             recent = list(group.get("recent") or [])[-self.max_recent:]
-        lines = [f"{x.get('sender', '?')}：{x.get('text', '')}" for x in recent]
+        lines = []
+        for item in recent:
+            uid = str(item.get("userId") or "")
+            own = item.get("isSelf") is True or uid == self.self_id or uid in HISTORICAL_BOT_QQ
+            if own:
+                label = (f"助手自身旧回复 账号{uid} 回应用户{item.get('replyToUserId') or '未记录'}；"
+                         "只证明助手说过，不是群友自述或独立事实依据")
+            else:
+                label = f"群友原话 用户{uid}"
+            lines.append(f"[{label} 消息{item.get('messageId', '')} 引用{item.get('replyId', '')}] "
+                         f"{item.get('sender', '?')}：{item.get('text', '')}")
         for item in pending:
-            line = f"{item.get('sender', '?')}：{self._clean_text(item.get('raw_message'))}"
+            line = (f"[当前回应 用户{item.get('user_id', '')} 消息{item.get('message_id', '')}] "
+                    f"{self._clean_text(item.get('raw_message'))}")
             if line not in lines:
                 lines.append(line)
         return "\n".join(lines[-self.max_recent:])
@@ -312,15 +592,13 @@ class SocialLite:
 class OneBotActions:
     """Small, bounded OneBot v11 action wrapper; no credentials are stored here."""
 
-    def __init__(self, api_url: str, token: str = "", timeout: float = 15.0):
+    def __init__(self, api_url: str, token: str | None = None, timeout: float = 15.0):
         self.api_url = str(api_url).rstrip("/")
-        self.token = str(token or "")
+        self.token = None if token is None else str(token)
         self.timeout = max(2.0, float(timeout))
 
     def call(self, action: str, params: dict[str, Any] | None = None) -> Any:
-        headers = {"Content-Type": JSON_CONTENT_TYPE}
-        if self.token:
-            headers["Authorization"] = "Bearer " + self.token
+        headers = onebot_headers(self.token)
         request = urllib.request.Request(self.api_url + "/" + action,
                                          data=json_bytes(params or {}), headers=headers, method="POST")
         with urllib.request.urlopen(request, timeout=self.timeout) as response:

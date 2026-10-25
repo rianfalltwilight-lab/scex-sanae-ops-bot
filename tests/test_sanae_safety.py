@@ -30,6 +30,8 @@ class SanaeSafetyTests(unittest.TestCase):
     def setUp(self):
         s._HISTORY.clear()
         s._LAST_MEMBER.clear()
+        s._LAST_INTERACTION.clear()
+        s._CHAT_HISTORY.clear()
 
     def test_usage_footer_matches_upstream_transparency_format(self):
         with mock.patch.object(s, "_price_quote", return_value=((3.0, 0.10, 9.0), True, True)), \
@@ -39,10 +41,9 @@ class SanaeSafetyTests(unittest.TestCase):
                 "prompt_tokens": 2000, "prompt_cache_hit_tokens": 1500,
                 "completion_tokens": 200}})
             footer = usage.footer()
-        self.assertIn("模型：deepseek-v4-flash", footer)
-        self.assertIn("费用：约 0.0034 元（官方高峰价）", footer)
-        self.assertIn("用量：2,200 tok（入 2,000，出 200，缓存命中 1,500）｜1 次请求", footer)
-        self.assertIn("耗时：1.30s", footer)
+        self.assertIn("2,200 tok，约 ¥0.0034", footer)
+        self.assertEqual((usage.prompt, usage.completion, usage.cache, usage.calls), (2000, 200, 1500, 1))
+        self.assertTrue(usage.saw_peak)
 
     def test_glm53_footer_exposes_usage_when_price_is_unpublished(self):
         usage = s._Usage()
@@ -52,9 +53,9 @@ class SanaeSafetyTests(unittest.TestCase):
                    quote=(0.22, 0.007, 0.66),
                    pricing_label='参考价')
         footer = usage.footer()
-        self.assertIn('模型：glm-5.3', footer)
-        self.assertIn('费用：约 0.0004 元（参考价）', footer)
-        self.assertIn('用量：1,540 tok（入 1,200，出 340，缓存命中 500）｜1 次请求', footer)
+        self.assertIn('1,540 tok，约 ¥0.0004', footer)
+        self.assertEqual(usage.model, 'glm-5.3')
+        self.assertEqual((usage.prompt, usage.completion, usage.cache), (1200, 340, 500))
 
     def test_glm53_usage_reads_zhipu_cached_tokens_field(self):
         usage = s._Usage()
@@ -65,10 +66,10 @@ class SanaeSafetyTests(unittest.TestCase):
                   quote=(0.22, 0.007, 0.66),
                   pricing_label='参考价')
         footer = usage.footer()
-        self.assertIn('费用：约 0.0002 元（参考价）', footer)
-        self.assertIn('缓存命中 600', footer)
+        self.assertIn('1,100 tok，约 ¥0.0002', footer)
+        self.assertEqual(usage.cache, 600)
 
-    def test_glm53_requests_enable_low_reasoning(self):
+    def test_serious_requests_default_to_high_reasoning(self):
         response = {'model': 'glm-5.3', 'choices': [{'message': {'content': 'ok'}}],
                     'usage': {'prompt_tokens': 10, 'completion_tokens': 2}}
         with mock.patch.object(s, '_post', return_value=response) as post:
@@ -76,7 +77,7 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertEqual(answer, 'ok')
         payload = post.call_args.args[2]
         self.assertEqual(payload['thinking'], {'type': 'enabled'})
-        self.assertEqual(payload['reasoning_effort'], 'low')
+        self.assertEqual(payload['reasoning_effort'], 'high')
 
     def test_gemini_endpoint_is_native_and_rejects_unsafe_base(self):
         self.assertEqual(
@@ -181,12 +182,12 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertEqual(parsed["offpeak"], (1.5, 0.05, 4.5))
         self.assertEqual(parsed["peak"], (3.0, 0.10, 9.0))
 
-    def test_plain_reply_also_gets_footer(self):
+    def test_plain_reply_omits_footer_by_default(self):
         usage = mock.Mock()
         usage.footer.return_value = "———\n模型：test｜费用：无法计算｜耗时：0.01s"
         with mock.patch.object(s, "run_agent", return_value=("回答", usage, False)):
             out = s.sanae_reply("[CQ:at,qq=1002] 你好", "u", privileged=True)
-        self.assertIn("模型：test", out)
+        self.assertEqual("回答", out)
 
     def test_member_and_admin_rcon_allowlists(self):
         self.assertTrue(s._member_safe("neoforge tps"))
@@ -246,7 +247,7 @@ class SanaeSafetyTests(unittest.TestCase):
                 force=True, selected_server=server, explicit_server=True,
                 include_usage_footer=False)
             blocked = s.sanae_reply(
-                '[CQ:at,qq=1002] 普通聊天', 'member', privileged=False,
+                '普通聊天', 'member', privileged=False,
                 force=True, selected_server=server, explicit_server=True,
                 include_usage_footer=False)
         self.assertEqual('当前在线 2 人', answer)
@@ -297,7 +298,7 @@ class SanaeSafetyTests(unittest.TestCase):
                 'request_console_command', {'command': 'op ExamplePlayer'}, True,
                 current_user_text='怀旧服给 ExamplePlayer OP', selected_server=server,
                 user_id='1', nickname='管理员', explicit_server=True)
-        self.assertIn('回复早苗：确认 ABCD', accepted)
+        self.assertIn('回复' + s.BOT_NAME + '：确认 ABCD', accepted)
         self.assertIn('本服注册语法：/op <targets>', accepted)
         dispatch.assert_called_once()
 
@@ -618,8 +619,10 @@ class SanaeSafetyTests(unittest.TestCase):
         payload = post.call_args.args[2]
         self.assertEqual(payload['model'], s.VISION_MODEL)
         self.assertIsInstance(payload['messages'][1]['content'], list)
-        self.assertIn(f'模型：{s.VISION_MODEL}', footer)
-        self.assertIn('无法计算', footer)
+        self.assertEqual(usage.model, s.VISION_MODEL)
+        self.assertIn('2,200 tok', footer)
+        self.assertIn('饭钱还没核到', footer)
+        self.assertNotIn('¥', footer)
 
     def test_gif_is_converted_to_contact_sheet(self):
         from PIL import Image
@@ -655,7 +658,7 @@ class SanaeSafetyTests(unittest.TestCase):
         with mock.patch.object(s, '_fetch_reply_raw', return_value=quoted), \
              mock.patch.object(s, 'run_agent', side_effect=fake_agent):
             out = s.sanae_reply(raw, 'u', privileged=True)
-        self.assertTrue(out.startswith('ok\n'))
+        self.assertEqual(out, 'ok')
         self.assertEqual(captured['image_url'], 'https://cdn.example/quoted.png')
         self.assertIn('原消息图片', captured['reference'])
 
@@ -673,9 +676,8 @@ class SanaeSafetyTests(unittest.TestCase):
             return "ok", mock.Mock(footer=lambda: "———\n模型：test｜费用：无法计算｜耗时：0.01s"), False
         raw = "[CQ:at,qq=1002] 正文问题"
         with mock.patch.object(s, "run_agent", side_effect=fake_agent):
-            out = s.sanae_reply(raw, "u", nickname="狗蛋的邮箱第一条是什么", privileged=True)
-        self.assertTrue(out.startswith("ok\n"))
-        self.assertIn("模型：", out)
+            out = s.sanae_reply(raw, "u", nickname="测试用户的邮箱第一条是什么", privileged=True)
+        self.assertEqual(out, "ok")
         self.assertEqual(captured["text"], "正文问题")
         self.assertNotIn("邮箱", captured["text"])
 

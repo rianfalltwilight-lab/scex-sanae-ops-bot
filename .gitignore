@@ -26,3 +26,11 @@ slang-*/
 social-lite-*/
 
 build/
+
+# Per-deployment configuration and local service adapters
+env.ps1
+start.ps1
+servers-extra.json
+secrets/
+shop-monitor/
+*.local.json

@@ -9,7 +9,9 @@ from social_feedback import FeedbackStore
 
 class FeedbackTests(unittest.TestCase):
     def make(self):
-        root = Path(tempfile.mkdtemp(prefix='feedback-', dir=str(Path(__file__).resolve().parents[1])))
+        temp = tempfile.TemporaryDirectory(prefix='feedback-', dir=str(Path(__file__).resolve().parents[1]))
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
         return FeedbackStore(root / 'feedback.json')
 
     def test_group_and_admin_gates(self):

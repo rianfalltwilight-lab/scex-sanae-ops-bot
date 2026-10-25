@@ -6,9 +6,20 @@ $env:LLBOT_API = 'http://127.0.0.1:3000'
 $env:LLBOT_GROUP = 'YOUR_GROUP_ID'
 $env:LLBOT_MANAGEMENT_GROUP = 'YOUR_MANAGEMENT_GROUP_ID'
 $env:SANAE_BOT_QQ = 'YOUR_BOT_QQ'
+$env:SANAE_GROUPS = $env:LLBOT_GROUP # 多群用逗号分隔
+$env:SANAE_RELAY_GROUPS = $env:LLBOT_GROUP # 允许转发到服务器的群
+# $env:SANAE_HISTORICAL_BOT_QQ = 'OLD_BOT_ID,OTHER_OLD_BOT_ID'
+# 如 OneBot 启用鉴权，在本机私有配置中设置 LLBOT_API_TOKEN / LLBOT_CALLBACK_TOKEN。
 $env:LLBOT_SOURCE_IPS = '127.0.0.1'
-$env:SCE_SERVER_REGISTRY = Join-Path $PSScriptRoot '..\servers.json'
+$env:SCE_SERVER_REGISTRY = Join-Path $PSScriptRoot 'servers.json'
 $env:SANAE_BRIDGE_PORT = '18790'
+
+$env:SANAE_MENTION_ONLY = '1'
+$env:SANAE_NAME_CALL_ENABLED = '0'
+$env:SANAE_SILENT_VISION = '0'
+$env:SANAE_ENABLE_BACKUP_WATCH = '0'
+$env:SANAE_ENABLE_NAST_SYNC = '0'
+$env:SANAE_ENABLE_LEGACY_MONITOR = '0'
 
 $env:SOCIAL_LITE_ENABLED = '1'
 $env:SOCIAL_LITE_GROUP = $env:LLBOT_GROUP
@@ -18,14 +29,18 @@ $env:SOCIAL_LITE_AMBIENT_WEIGHT = '0.1'
 $env:SOCIAL_STICKER_MODE = 'auto'
 $env:SOCIAL_STICKER_COOLDOWN = '45'
 
-$env:DEEPSEEK_TEXT_MODEL = 'deepseek-v4-flash'
+$env:DEEPSEEK_TEXT_MODEL = 'deepseek-flash'
 $env:DEEPSEEK_REASONING_EFFORT = 'low'
-$env:SANAE_TEXT_PROVIDER = 'deepseek' # 改为 gemini 时走原生 generateContent
+$env:SANAE_TEXT_PROVIDER = 'deepseek' # deepseek / gemini / gpt6luna
 $env:GOOGLE_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com'
 $env:GEMINI_MODEL = 'gemini-3.8-flash'
 $env:GEMINI_THINKING_LEVEL = 'low'
 # GEMINI_API_KEY 不要写入此文件；生产环境请存入私有 secrets.json 的 gemini_api_key。
-$env:ZHIPU_VISION_MODEL = 'glm-4.5v-flash'
+# OpenAI 兼容适配：使用你的服务实际支持的模型；密钥放 secrets.json 的 gpt6luna_api_key。
+# $env:GPT6LUNA_BASE_URL = 'https://api.openai.com'
+# $env:GPT6LUNA_MODEL = 'YOUR_MODEL_ID'
+$env:SANAE_VISION_PROVIDER = 'zhipu' # zhipu / deepseek
+$env:ZHIPU_VISION_MODEL = 'glm-5.3-flash'
 $env:RELAY_G2S = '1'
 
 # Optional local media tools; leave unset when unused.
@@ -33,3 +48,11 @@ $env:RELAY_G2S = '1'
 # $env:SANAE_FFMPEG = "<ffmpeg executable>"
 # $env:SANAE_NODE = "<Node executable>"
 # $env:SANAE_SILK_MODULE = "<silk-wasm entry module>"
+
+# Optional server routing and service adapters; see docs/UPDATE-20261025.md.
+# $env:SCE_SERVER_EXTRA_REGISTRY = Join-Path $PSScriptRoot 'servers-extra.json'
+# $env:SCE_SERVER_GROUP_DEFAULTS = 'YOUR_GROUP_ID:legacy,OTHER_GROUP_ID:remote'
+# $env:LEGACY_MONITOR_GROUPS = $env:LLBOT_GROUP
+# $env:SANAE_LEGACY_BACKUP_PIPELINE = '<backup pipeline script>'
+# $env:SANAE_MSLX_CONTROL_SCRIPT = '<MSLX control script>'
+# $env:SANAE_SHOP_MONITOR_ROOT = '<shop monitor data directory>'

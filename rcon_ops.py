@@ -25,8 +25,8 @@ from ops_contract import append_jsonl, command_result
 from server_registry import active_server, query_server, server_context
 from command_catalog import normalize_console_command
 
-# 服务器根目录（Mac 侧）
-SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", "/Users/goudanli/Downloads/NAST Server1.9.9"))
+# 服务器根目录，可按部署主机配置
+SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", str(Path(__file__).resolve().parent / "server")))
 ADDR = os.environ.get("MC_SERVER_ADDR", "example.invalid:25565")
 
 # 命令权限：普通 vs 管理员
@@ -287,6 +287,8 @@ def cmd_help(privileged):
         f'当前服务：{media_status}\n'
         '未启用或未配置的媒体服务不会调用。\n'
         '\n◆ 服务器与趣味\n'
+        '!ping 运营商参考节点延迟与上传测速；!ping full 三轮加强测速\n'
+        '测早苗所在主机，无需选服；全局冷却90秒，仅同时运行一份。\n'
         '!list 在线列表；!day 游戏天数与时间；!rules 规则\n'
         '!version 版本；!uptime 运行状态；!ip 连接地址\n'
         '服务器启动完成会通知玩家群，包含总耗时、Minecraft内部阶段耗时和连接地址。\n'
@@ -335,6 +337,9 @@ def cmd_day():
 
 
 def cmd_tps():
+    server = active_server()
+    if server and str(server.get('kind') or '').casefold() == 'status':
+        return "[性能] 该服务器目前只接入公开状态探测，未配置 RCON/TPS 接口。"
     try:
         output = _run("neoforge tps")
         parts = []
@@ -391,18 +396,25 @@ def cmd_say(text):
         return f"[公告] 发送失败：{e}"
 
 
-def cmd_stop():
+def cmd_stop(uid=''):
+    if (active_server() or {}).get('id') == 'legacy':
+        import legacy_mslx_control
+        return _request_risk(uid, "停止怀旧服", "stop",
+                             lambda: legacy_mslx_control.start('stop', uid))
     return ("[控制台] 当前 MCSManager 已启用 autoRestart，RCON stop 会自动重新拉起，"
             "无法实现持续停服。请在 MCSManager 面板先关闭自动重启后再停服。")
 
 
-def _execute_restart():
+def _execute_restart(uid=''):
+    if (active_server() or {}).get('id') == 'legacy':
+        import legacy_mslx_control
+        return legacy_mslx_control.start('restart', uid)
     _run("stop")
     return "[控制台] 已安全发送 stop；MCSManager 将按 autoRestart 设置重新拉起服务器。"
 
 
 def cmd_restart(uid):
-    return _request_risk(uid, "重启服务器", "restart", _execute_restart)
+    return _request_risk(uid, "重启服务器", "restart", lambda: _execute_restart(uid))
 
 
 def _execute_cmd(command):
@@ -468,6 +480,13 @@ def cmd_version():
 
 def cmd_uptime():
     """RCON 可达即视为在线（uptime 精确值需读 Mac 日志，跨机器不可行）。"""
+    server = active_server()
+    if server and str(server.get('kind') or '').casefold() == 'status':
+        try:
+            _run("list")
+            return "[运行时长] 公开状态接口可达；该接口不提供精确开服时长。"
+        except Exception as e:
+            return f"[运行时长] 状态接口不可达：{e}"
     try:
         _run("list")
         return "[运行时长] 服务器当前在线（RCON 可达）。精确开服时长需在服务端查 logs/latest.log。"
@@ -514,11 +533,14 @@ def cmd_ai_status():
         import sanae_ai as _s
         return _s.ai_status()
     except Exception:
-        return "[AI] 当前模型：deepseek-v4-flash（DeepSeek API 直连，不走 agent）"
+        return "当前模型：deepseek-v4-flash（DeepSeek API 直连，不走 agent）"
 
 
 def _cmd_backup():
     """!backup：启动独立可靠流水线，立即返回，不阻塞 bridge 请求线程。"""
+    if (active_server() or {}).get('id') == 'legacy':
+        from legacy_backup_control import start
+        return start()
     pipeline = Path(__file__).with_name("backup_pipeline.py")
     log_dir = Path(__file__).with_name("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +564,9 @@ def _cmd_backup():
 
 
 def _cmd_backup_status():
+    if (active_server() or {}).get('id') == 'legacy':
+        from legacy_backup_control import status_text
+        return status_text()
     status_path = Path(__file__).with_name("logs") / "backup-pipeline-status.json"
     try:
         data = json.loads(status_path.read_text(encoding="utf-8"))
@@ -561,7 +586,7 @@ def _cmd_backup_status():
     if sync:
         lines.append(f"异地：{sync.get('message', sync.get('state', '未知'))}")
         if sync.get("localSize"):
-            lines.append(f"字节校验：Mac {sync.get('localSize')} / Monarch {sync.get('remoteSize', 0)}")
+            lines.append(f"字节校验：源端 {sync.get('localSize')} / 目标端 {sync.get('remoteSize', 0)}")
     return "\n".join(lines)
 
 
@@ -617,7 +642,7 @@ def _dispatch(command, nickname, uid, privileged):
     if word in ("say",):
         return cmd_say(cmd[len(word):])
     if word == "stop":
-        return cmd_stop()
+        return cmd_stop(uid)
     if word == "restart":
         return cmd_restart(uid)
     if word in ("cmd", "控制台"):

@@ -2,6 +2,7 @@
 from collections import OrderedDict
 from http.server import HTTPServer
 from socketserver import ThreadingMixIn
+import contextvars
 import queue
 import socket
 import threading
@@ -26,8 +27,13 @@ class WorkQueue:
 
     def submit(self, callback, *, block=False):
         self.start()
+        # Preserve request-local routing state (for example, the QQ group a
+        # reply belongs to) when work leaves the event thread.  Without this,
+        # a multi-group bridge falls back to its historical default group.
+        context = contextvars.copy_context()
+        wrapped = lambda: context.run(callback)
         try:
-            self.queue.put(callback, block=block)
+            self.queue.put(wrapped, block=block)
             return True
         except queue.Full:
             return False
@@ -135,10 +141,12 @@ AI_JOBS = WorkQueue(2, 16, 'bridge-ai')
 
 
 def start_worker(target, args=()):
-    # Called by the single event router or a social timer, never by pool workers.
-    # Backpressure stays in the router; the bounded inbox returns HTTP 503 when full.
-    return JOBS.submit(lambda: target(*args), block=True)
+    # Never let the event router wait on slow RCON/HTTP work.  A full
+    # downstream queue is reported as a dropped job instead of backpressuring
+    # the bounded OneBot event inbox until it returns HTTP 503.
+    return JOBS.submit(lambda: target(*args), block=False)
 
 
 def start_ai_worker(target, args=()):
-    return AI_JOBS.submit(lambda: target(*args), block=True)
+    # AI backpressure must not block OneBot event intake either.
+    return AI_JOBS.submit(lambda: target(*args), block=False)
