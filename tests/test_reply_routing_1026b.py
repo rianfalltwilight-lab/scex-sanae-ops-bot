@@ -243,7 +243,7 @@ class CommissionRewardTests(unittest.TestCase):
                             'kind': 'ITEM', 'reward_item': 'minecraft:diamond'},
                            {'item': 'minecraft:carrot', 'quantity': 64, 'reward': 900, 'kind': 'COIN', 'reward_item': ''})
         overview = world_records.format_market('[怀旧]', data, names)
-        self.assertIn('金锭 ×128，报酬 钻石 ×1（第 258 天截止，祝が 发布）', overview)
+        self.assertIn('金锭 ×128，报酬 钻石 ×1（第 258 天截止，FixtureRequester 发布）', overview)
         self.assertIn('胡萝卜 ×64，报酬 900 币（第 258 天截止', overview)
         detail = world_records.format_market('[怀旧]', data, names, item='金锭')
         self.assertIn('- 有收购委托：128 个，报酬 钻石 ×1，第 258 天截止', detail)

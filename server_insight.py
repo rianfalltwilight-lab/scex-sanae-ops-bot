@@ -189,8 +189,10 @@ def events(ops_root, window='24h', player='', kind='', limit=30, now=None, onlin
     if not rows:
         return head + '\n没有符合条件的记录。事件从实时日志记录，采集中断期间会缺失。'
     shown = rows[-max(1, min(int(limit or 30), 60)):]
-    body = [f'{_stamp(r["timestamp"])} {re.sub(r"^\[[^\]]+\]\s*", "", str(r.get("text")))[:200]}'
-            for r in shown]
+    body = []
+    for row in shown:
+        text = re.sub(r'^\[[^\]]+\]\s*', '', str(row.get('text')))[:200]
+        body.append(f'{_stamp(row["timestamp"])} {text}')
     more = f'\n（只列出最近 {len(shown)} 条）' if len(shown) < len(rows) else ''
     return head + '\n' + '\n'.join(body) + more + _open_sessions(ops_root, now, seconds, player, online)
 
