@@ -95,12 +95,10 @@ class IntakeTests(unittest.TestCase):
         event=self.event(media=True)
         h=object.__new__(bridge.BridgeHandler)
         empty=types.SimpleNamespace(append=lambda *a:None,observe=lambda *a:None,command=lambda *a,**k:None)
-        with patch.multiple(bridge,SOCIAL_ARCHIVE=empty,SOCIAL_MEMORY=empty,SLANG_LEARNER=empty,
+        with patch.multiple(bridge,SOCIAL_ARCHIVE=empty,
                             FEEDBACK_STORE=empty,STICKER_CATALOG=empty), \
              patch.object(bridge,'_start_ai_worker') as submit, \
              patch.object(bridge,'_selection_reply',return_value=None), \
-             patch.object(bridge,'match_ops_command',return_value=None), \
-             patch.object(bridge,'_command_target',return_value=(None, '', False, '')), \
              patch.object(bridge,'_binding_command',return_value=None), \
              patch.object(ai,'knowledge_command',return_value=None):
             h._process_event(event)

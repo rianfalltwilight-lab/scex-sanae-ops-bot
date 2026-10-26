@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / 'build/offline-tests'
 OUTPUT.mkdir(parents=True, exist_ok=True)
 BOOTSTRAP = r'''
-import os, socket, sys, tempfile, unittest
+import json, os, socket, sys, tempfile, unittest
 from pathlib import Path
 repo, name = Path(sys.argv[1]), sys.argv[2]
 sys.path[:0] = [str(repo), str(repo / 'tests')]
@@ -26,7 +26,18 @@ def isolated_connect(sock, address):
 socket.socket.connect = isolated_connect
 socket.socket.connect_ex = forbidden
 with tempfile.TemporaryDirectory(prefix='sanae-public-test-', dir=repo / 'build/offline-tests') as tmp:
+    # Keep new default_path() state, nested fixture dirs and child processes inside this run.
+    os.environ.update(TEMP=tmp, TMP=tmp, TMPDIR=tmp)
+    tempfile.tempdir = tmp
     os.environ['SCE_BOT_TEST_MODE'] = '1'
+    registry = json.loads((repo / 'examples/servers.example.json').read_text(encoding='utf-8-sig'))
+    for server in registry['servers']:
+        server['server_dir'] = str(Path(tmp) / 'server' / server['id'])
+        server['password_file'] = str(Path(tmp) / 'no-live-password.txt')
+    registry_path = Path(tmp) / 'servers.json'
+    registry_path.write_text(json.dumps(registry), encoding='utf-8')
+    os.environ['SCE_SERVER_REGISTRY'] = str(registry_path)
+    os.environ['SCE_SERVER_EXTRA_REGISTRY'] = ''
     os.environ['LLBOT_GROUP'] = '1001'
     os.environ['SANAE_GROUPS'] = '1001'
     os.environ['SOCIAL_LITE_GROUP'] = '1001'
@@ -55,6 +66,10 @@ with tempfile.TemporaryDirectory(prefix='sanae-public-test-', dir=repo / 'build/
 
 names = sys.argv[1:] or [p.stem for p in sorted((ROOT / 'tests').glob('test_*.py'))]
 results = []
+# Imported module constants must not inherit settings from an operator's live shell.
+config_prefix = re.compile(r'^(SANAE_|SOCIAL_|GEMINI_|GOOGLE_GEMINI_|DEEPSEEK_|GPT6LUNA_|ZHIPU_|SCE_|LLBOT_|EXPRESSION_MEMORY|REPLY_LESSONS|CONVERSATION_MEMORY|SLANG_|FEEDBACK_|STICKER_|OPS_|FUN_MUTE_|RELAY_|LEGACY_|GROUP_CHAT_)')
+clean_env = {key: value for key, value in os.environ.items() if not config_prefix.match(key)}
+clean_env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
 for name in names:
     if not re.fullmatch(r'test_[A-Za-z0-9_]+', name) or not (ROOT / 'tests' / (name + '.py')).is_file():
         raise SystemExit('Unknown test module: ' + name)
@@ -62,7 +77,7 @@ for name in names:
         process = subprocess.run(
             [sys.executable, '-X', 'utf8', '-c', BOOTSTRAP, str(ROOT), name],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-            env=dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8'), timeout=100,
+            env=clean_env, timeout=100,
         )
         output, code = process.stdout, process.returncode
     except subprocess.TimeoutExpired as exc:

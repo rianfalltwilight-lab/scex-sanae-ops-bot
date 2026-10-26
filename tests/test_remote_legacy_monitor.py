@@ -165,7 +165,7 @@ class RemoteMonitorTests(unittest.TestCase):
         self.ops.observe_lines.return_value = []
         self.startup = mock.Mock()
         self.coordinator = mock.Mock(side_effect=AssertionError('local probe must not run'))
-        self.weekly = mock.Mock(side_effect=AssertionError('local reports must not run'))
+        self.weekly = mock.Mock(return_value='not-due')
         modules = {
             'ops_contract': types.SimpleNamespace(read_incremental_lines=mock.Mock(
                 side_effect=AssertionError('local log read must not run'))),
@@ -185,6 +185,47 @@ class RemoteMonitorTests(unittest.TestCase):
                 'LEGACY_MONITOR_GROUPS': '1001,1003,1001'}):
             spec.loader.exec_module(self.monitor)
         self.monitor.STATE_DIR = self.temp.name
+        # Remote IO is represented by fixtures; no SSH or mirror thread runs here.
+        self.crashes = mock.Mock(return_value=([], {'source': 'fixture'}, True))
+        self.monitor.read_remote_crashes = self.crashes
+        self.mirror = mock.Mock(return_value=False)
+        self.real_refresh_mirror = self.monitor.refresh_mirror
+        self.monitor.refresh_mirror = self.mirror
+        self.real_mirror_extras = self.monitor._mirror_extras
+        self.monitor._mirror_extras = mock.Mock()
+        for name, result in {
+                'player_stats': {'players': []},
+                'forced_chunks': {'dims': {}, 'errors': []},
+                'thaumcraft_progress': {'players': {}, 'errors': 0},
+                'login_records': {'players': []},
+                'vanilla_advancements': {},
+        }.items():
+            patcher = mock.patch.object(self.monitor.remote_server_reader, name, return_value=result)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_mirror_extras_syncs_trees_stats_and_daily_catalog_without_ssh(self):
+        monitor = self.monitor
+        monitor._mirror_extras = self.real_mirror_extras
+        tree = mock.Mock(return_value={'fetched': 1, 'deleted': 0, 'missing': 0})
+        stats = mock.Mock(return_value={'generated_at': 1, 'players': {'Alice': {'play_hours': 3}}})
+        catalog = mock.Mock(return_value={'count': 42})
+        with mock.patch.object(monitor.remote_mods_mirror, 'sync_tree', tree), \
+                mock.patch.object(monitor.remote_server_reader, 'player_stats', stats), \
+                mock.patch.object(monitor.command_catalog, 'refresh_server', catalog):
+            monitor._mirror_extras()
+            monitor._mirror_extras()  # The command catalog is refreshed daily.
+        self.assertEqual(len(monitor.MIRROR_TREES) * 2, tree.call_count)
+        self.assertEqual(2, stats.call_count)
+        catalog.assert_called_once_with(self.server, monitor.query_server)
+        saved = json.loads((Path(self.temp.name) / 'player-stats.json').read_text(encoding='utf-8'))
+        self.assertEqual(3, saved['players']['Alice']['play_hours'])
+        self.assertEqual(42, monitor.load_state('legacy-command-catalog')['count'])
+        tree.side_effect = OSError('fixture read failed')
+        stats.side_effect = OSError('fixture read failed')
+        with mock.patch.object(monitor.remote_mods_mirror, 'sync_tree', tree), \
+                mock.patch.object(monitor.remote_server_reader, 'player_stats', stats):
+            monitor._mirror_extras()
 
     def test_one_group_failure_retries_without_duplicate_successful_group(self):
         monitor = self.monitor
@@ -211,7 +252,9 @@ class RemoteMonitorTests(unittest.TestCase):
         self.assertIsNone(monitor.STARTUP)
         self.startup.assert_not_called()
         self.coordinator.assert_not_called()
-        self.weekly.assert_not_called()
+        # Remote sampling can publish weekly reports without running local collectors.
+        self.assertEqual([mock.call(self.ops, push, (1001, 1003))] * 2,
+                         self.weekly.call_args_list)
         self.ops.periodic_maintenance.assert_not_called()
         self.ops.sample_runtime.assert_called_once()
         push.assert_not_called()

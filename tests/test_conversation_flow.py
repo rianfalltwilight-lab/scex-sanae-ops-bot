@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 with mock.patch.object(socket.socket, 'connect', side_effect=AssertionError('network disabled')):
     s = importlib.import_module('sanae_ai')
     social = importlib.import_module('social_lite')
-    slang = importlib.import_module('slang_learner')
     feedback = importlib.import_module('social_feedback')
     bridge = importlib.import_module('llbot_bridge')
 
@@ -219,7 +218,7 @@ class InvocationCooldownTests(OfflineCase):
     def setUp(self):
         super().setUp()
         clock = mock.patch.object(s.time, 'time', return_value=10000)
-        agent = mock.patch.object(s, 'run_agent', return_value=('回答', mock.Mock(calls=0), False))
+        agent = mock.patch.object(s, 'run_agent', return_value=('回答', mock.Mock(calls=0, model_answer=True), False))
         quote = mock.patch.object(s, '_with_reply_context', side_effect=lambda raw, **kwargs: raw)
         for patcher in (clock, agent, quote):
             patcher.start()
@@ -288,20 +287,6 @@ class SocialVocabularyTests(OfflineCase):
             self.assertEqual(layer.spontaneous_probability, 1)
             self.assertEqual(layer.ambient_reply_weight, 0)
 
-    def test_slang_requires_current_confirmed_term_and_ignores_punctuation(self):
-        learner = slang.SlangLearner(self.fixture_dir()/'slang.json')
-        learner._entries = [
-            {'term': 'yyds', 'meaning': '永远的神', 'status': 'confirmed', 'count': 3},
-            {'term': '抽象梗', 'meaning': '暂未确认', 'status': 'candidate', 'count': 9},
-            {'term': '？', 'meaning': '纯标点', 'status': 'confirmed', 'count': 99}]
-        self.assertEqual(learner.context(), '')
-        self.assertEqual(learner.context(text='今天吃什么？'), '')
-        self.assertEqual(learner.context(text='抽象梗'), '')
-        context = learner.context(text='这次真的yyds')
-        self.assertIn('yyds：永远的神', context)
-        self.assertNotIn('暂未确认', context)
-        self.assertNotIn('纯标点', context)
-
     def test_negative_feedback_does_not_prescribe_even_shorter_replies(self):
         store = feedback.FeedbackStore(self.fixture_dir()/'feedback.json')
         store._items = [{'rating': 'negative'}, {'rating': 'negative'}]
@@ -347,17 +332,13 @@ class BridgeConversationTests(OfflineCase):
                     '_is_duplicate': mock.Mock(return_value=False),
                     '_pending_natural_operation_reply': mock.Mock(return_value=None),
                     '_natural_server_operation_candidate': mock.Mock(return_value=False),
-                    '_fun_mute_reason': mock.Mock(return_value=None),
-                    'match_ops_command': mock.Mock(return_value=False),
+                    '_fun_mute_observe': mock.Mock(return_value=None),
                     '_command_target': mock.Mock(return_value=(None, event['raw_message'], False, '')),
                 }.items():
                     stack.enter_context(mock.patch.object(bridge, name, value))
-                for owner, name in ((bridge.SOCIAL_ARCHIVE, 'append'),
-                                    (bridge.SOCIAL_MEMORY, 'observe'),
-                                    (bridge.SLANG_LEARNER, 'observe')):
+                for owner, name in ((bridge.SOCIAL_ARCHIVE, 'append'),):
                     stack.enter_context(mock.patch.object(owner, name))
-                for owner, name in ((bridge.SLANG_LEARNER, 'command'),
-                                    (bridge.FEEDBACK_STORE, 'command'),
+                for owner, name in ((bridge.FEEDBACK_STORE, 'command'),
                                     (bridge.STICKER_CATALOG, 'command')):
                     stack.enter_context(mock.patch.object(owner, name, return_value=None))
                 stack.enter_context(mock.patch.object(bridge._network_commands, 'handle', return_value=False))
@@ -377,8 +358,6 @@ class BridgeConversationTests(OfflineCase):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         for owner, name, value in (
-            (bridge.SLANG_LEARNER, 'context', ''),
-            (bridge.SOCIAL_MEMORY, 'context', ''),
             (bridge.FEEDBACK_STORE, 'strategy_hint', ''),
             (bridge.SOCIAL_LITE, 'expression_style_hint', ''),
             (bridge.STICKER_CATALOG, 'recommend', []),
@@ -387,7 +366,7 @@ class BridgeConversationTests(OfflineCase):
         stack.enter_context(mock.patch.object(bridge, 'send_group_msg', side_effect=AssertionError('unexpected send')))
         return stack
 
-    def test_social_bridge_passes_explicit_flag_and_current_slang_text(self):
+    def test_social_bridge_passes_explicit_flag(self):
         self.social_bridge_patches()
         for explicit in (False, True):
             with self.subTest(explicit=explicit), \
@@ -398,7 +377,6 @@ class BridgeConversationTests(OfflineCase):
                 self.assertEqual(reply.call_args.kwargs['explicit_interaction'], explicit)
                 self.assertFalse(reply.call_args.kwargs['privileged'])
                 self.assertTrue(reply.call_args.kwargs['social_only'])
-                bridge.SLANG_LEARNER.context.assert_called_with(text=event['raw_message'])
 
     def test_mention_bridge_preserves_member_permissions_and_short_flag(self):
         self.social_bridge_patches()
@@ -411,7 +389,6 @@ class BridgeConversationTests(OfflineCase):
         self.assertTrue(reply.call_args.kwargs['explicit_interaction'])
         self.assertTrue(reply.call_args.kwargs['short_reply'])
         self.assertFalse(reply.call_args.kwargs['privileged'])
-        bridge.SLANG_LEARNER.context.assert_called_once_with(text=event['raw_message'])
 
     def test_mention_bridge_does_not_label_live_query_or_admin_action_as_short_chat(self):
         self.social_bridge_patches()

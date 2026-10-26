@@ -6,6 +6,7 @@ RCON 反控命令模块（2026-08-16 按 upstream QQConsoleBridge 功能实现�
   + tps/backup/save/seed/weather/say/stop/restart/cmd（群主/管理员）
 - RCON 走 rcon_client（NeoForge 自动适配 neoforge tps）
 """
+import contextlib
 import os
 import re
 import json
@@ -24,10 +25,11 @@ from rcon_client import query, query_tps, query_list
 from ops_contract import append_jsonl, command_result
 from server_registry import active_server, query_server, server_context
 from command_catalog import normalize_console_command
+from public_errors import public_failure_label
 
-# 服务器根目录，可按部署主机配置
-SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", str(Path(__file__).resolve().parent / "server")))
-ADDR = os.environ.get("MC_SERVER_ADDR", "example.invalid:25565")
+# 服务器根目录（Mac 侧）
+SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", "/Users/goudanli/Downloads/NAST Server1.9.9"))
+ADDR = os.environ.get("MC_SERVER_ADDR", "scex.aerohakugyokurou.top:23323")
 
 # 命令权限：普通 vs 管理员
 PUBLIC_CMDS = {"help", "帮助", "list", "在线", "day", "date", "time", "日期", "rules", "规则",
@@ -269,7 +271,8 @@ def cmd_help(privileged):
         '!wiki 关键词 / !百科 关键词 查百科\n'
         '!配方 物品名或ID 查配方索引\n'
         '!周报 / !运行报告 查近7天统计；!周报 详情 / !体检 查统计口径与数据覆盖\n'
-        '周报每周一20:00（北京时间）自动发玩家群；包含性能、在线、启停、备份和磁盘。\n'
+        '周报每周一20:00（北京时间）自动发玩家群；包含性能、在线、玩家榜、进服和错误告警。\n'
+        '!bug 问题描述 报告服务器或模组问题（群里聊到的问题也会被自动记下）\n'
         '\n◆ AI 与共享知识\n'
         '@早苗 问题 进行问答；已保存的相关通用知识会自动用于回答。\n'
         '可回复合并转发后 @早苗 分析一下；或 @早苗 总结最近群聊。\n'
@@ -320,7 +323,8 @@ def cmd_list():
     try:
         return "[在线]\n" + _run("list")
     except Exception as e:
-        return f"[在线] 查询失败：{e}"
+        print(f'[rcon-ops] 在线 {type(e).__name__}: {e}', flush=True)
+        return f"[在线] 查询失败：{public_failure_label(e)}"
 
 
 def cmd_day():
@@ -333,7 +337,8 @@ def cmd_day():
         minute = (day_ticks % 1000) * 60 // 1000
         return f"游戏天数：第 {total_days} 天\n游戏时间：{hour:02d}:{minute:02d}"
     except Exception as e:
-        return f"[日期] 查询失败：{e}"
+        print(f'[rcon-ops] 日期 {type(e).__name__}: {e}', flush=True)
+        return f"[日期] 查询失败：{public_failure_label(e)}"
 
 
 def cmd_tps():
@@ -353,14 +358,16 @@ def cmd_tps():
                              f"({float(match.group(2)):.1f}ms)")
         return "[性能]\n" + ('\n'.join(parts) if parts else output)
     except Exception as e:
-        return f"[性能] 查询失败：{e}"
+        print(f'[rcon-ops] 性能 {type(e).__name__}: {e}', flush=True)
+        return f"[性能] 查询失败：{public_failure_label(e)}"
 
 
 def cmd_seed():
     try:
         return "[种子] " + _run("seed")[:200]
     except Exception as e:
-        return f"[种子] 查询失败：{e}"
+        print(f'[rcon-ops] 种子 {type(e).__name__}: {e}', flush=True)
+        return f"[种子] 查询失败：{public_failure_label(e)}"
 
 
 def cmd_save():
@@ -368,7 +375,8 @@ def cmd_save():
         _run("save-all flush")
         return "[存盘] 世界已保存到磁盘。"
     except Exception as e:
-        return f"[存盘] 保存失败：{e}"
+        print(f'[rcon-ops] 存盘 {type(e).__name__}: {e}', flush=True)
+        return f"[存盘] 保存失败：{public_failure_label(e)}"
 
 
 def cmd_weather(arg):
@@ -382,7 +390,8 @@ def cmd_weather(arg):
         label = {"clear": "晴天", "rain": "雨天", "thunder": "雷雨"}[target]
         return f"[天气] 已切换为{label}。"
     except Exception as e:
-        return f"[天气] 切换失败：{e}"
+        print(f'[rcon-ops] 天气 {type(e).__name__}: {e}', flush=True)
+        return f"[天气] 切换失败：{public_failure_label(e)}"
 
 
 def cmd_say(text):
@@ -393,7 +402,8 @@ def cmd_say(text):
         _run("say " + text.replace("\n", " ").replace("\r", " "))
         return f"[公告] 已发送到游戏公屏：{text[:200]}"
     except Exception as e:
-        return f"[公告] 发送失败：{e}"
+        print(f'[rcon-ops] 公告 {type(e).__name__}: {e}', flush=True)
+        return f"[公告] 发送失败：{public_failure_label(e)}"
 
 
 def cmd_stop(uid=''):
@@ -422,6 +432,22 @@ def _execute_cmd(command):
     if not result:
         result = "(命令已执行，无返回内容)"
     return "[控制台返回] " + command[:120] + "\n" + result[:3500]
+
+
+def run_console_direct(command, uid, query_fn=None, server=None, risk="read"):
+    """Run one console command the caller classified as read or low; audited, no code."""
+    token = _QUERY_FN.set(query_fn)
+    try:
+        with (server_context(server) if server is not None else contextlib.nullcontext()):
+            try:
+                result = _execute_cmd(command)
+            except Exception as e:
+                _audit("cmd_direct", uid, "cmd " + command, "failed: " + type(e).__name__)
+                return "[控制台] 执行失败：" + public_failure_label(e)
+        _audit("cmd_direct", uid, "cmd " + command, risk + ": " + result)
+        return result
+    finally:
+        _QUERY_FN.reset(token)
 
 
 def cmd_cmd(command, uid):
@@ -457,7 +483,8 @@ def cmd_rules():
                  f"火焰蔓延：{_gamerule('doFireTick')}"]
         return "【服务器规则】\n" + "\n".join(lines)
     except Exception as e:
-        return f"[规则] 查询失败：{e}"
+        print(f'[rcon-ops] 规则 {type(e).__name__}: {e}', flush=True)
+        return f"[规则] 查询失败：{public_failure_label(e)}"
 
 
 def cmd_version():
@@ -486,12 +513,14 @@ def cmd_uptime():
             _run("list")
             return "[运行时长] 公开状态接口可达；该接口不提供精确开服时长。"
         except Exception as e:
-            return f"[运行时长] 状态接口不可达：{e}"
+            print(f'[rcon-ops] 运行时长 {type(e).__name__}: {e}', flush=True)
+            return f"[运行时长] 状态接口不可达：{public_failure_label(e)}"
     try:
         _run("list")
         return "[运行时长] 服务器当前在线（RCON 可达）。精确开服时长需在服务端查 logs/latest.log。"
     except Exception as e:
-        return f"[运行时长] 服务器可能不在线（RCON 不可达）：{e}"
+        print(f'[rcon-ops] 运行时长 {type(e).__name__}: {e}', flush=True)
+        return f"[运行时长] 服务器可能不在线（RCON 不可达）：{public_failure_label(e)}"
 
 
 def cmd_ip():
@@ -536,6 +565,13 @@ def cmd_ai_status():
         return "当前模型：deepseek-v4-flash（DeepSeek API 直连，不走 agent）"
 
 
+def _backup_target_is_remote():
+    """The local backup pipeline only knows the Legacy server's old local copy."""
+    from server_registry import resolve_server
+    server = active_server() or resolve_server('legacy') or {}
+    return bool(server.get('remote_ssh_host'))
+
+
 def _cmd_backup():
     """!backup：启动独立可靠流水线，立即返回，不阻塞 bridge 请求线程。"""
     if (active_server() or {}).get('id') == 'legacy':
@@ -553,7 +589,8 @@ def _cmd_backup():
             start_new_session=True, close_fds=True,
         )
     except Exception as e:
-        return f"[备份] 无法启动备份流水线：{e}"
+        print(f'[rcon-ops] 备份 {type(e).__name__}: {e}', flush=True)
+        return f"[备份] 无法启动备份流水线：{public_failure_label(e)}"
     finally:
         # Popen 已复制文件描述符；父 bridge 必须关闭自己的句柄，避免每次 !backup 泄漏一个 FD。
         if log is not None:
@@ -573,7 +610,8 @@ def _cmd_backup_status():
     except FileNotFoundError:
         return "[备份状态] 暂无手动备份流水线记录。"
     except Exception as e:
-        return f"[备份状态] 状态文件读取失败：{e}"
+        print(f'[rcon-ops] 备份状态 {type(e).__name__}: {e}', flush=True)
+        return f"[备份状态] 状态文件读取失败：{public_failure_label(e)}"
     stage = data.get("stage", data.get("state", "unknown"))
     message = data.get("message", "")
     lines = [f"[备份状态] {stage}：{message}"]
@@ -629,6 +667,8 @@ def _dispatch(command, nickname, uid, privileged):
     if word in ("tps",):
         return cmd_tps()
     if word in ("backup",):
+        if _backup_target_is_remote():
+            return "[备份] 服务器在远端主机，本机不能创建或查看它的备份。"
         rest = cmd[len(cmd.split()[0]):].strip().lower()
         if rest in ("status", "状态", "进度"):
             return _cmd_backup_status()

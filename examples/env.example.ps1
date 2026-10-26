@@ -1,4 +1,4 @@
-$env:PYTHONUTF8 = '1'
+﻿$env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUNBUFFERED = '1'
 
@@ -20,6 +20,9 @@ $env:SANAE_SILENT_VISION = '0'
 $env:SANAE_ENABLE_BACKUP_WATCH = '0'
 $env:SANAE_ENABLE_NAST_SYNC = '0'
 $env:SANAE_ENABLE_LEGACY_MONITOR = '0'
+$env:SANAE_EXPRESSION_LEARNING = '0'
+$env:SANAE_PRIVATE_FORWARD = '0'
+$env:FUN_MUTE_AI = '0'
 
 $env:SOCIAL_LITE_ENABLED = '1'
 $env:SOCIAL_LITE_GROUP = $env:LLBOT_GROUP
@@ -33,15 +36,18 @@ $env:DEEPSEEK_TEXT_MODEL = 'deepseek-flash'
 $env:DEEPSEEK_REASONING_EFFORT = 'low'
 $env:SANAE_TEXT_PROVIDER = 'deepseek' # deepseek / gemini / gpt6luna
 $env:GOOGLE_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com'
-$env:GEMINI_MODEL = 'gemini-3.8-flash'
-$env:GEMINI_THINKING_LEVEL = 'low'
+$env:GEMINI_MODEL = 'YOUR_GEMINI_MODEL'
+$env:GEMINI_THINKING_LEVEL = 'high'
+$env:GEMINI_STREAM = '1'
+# Optional cross-provider fallback; requires a separately configured DeepSeek key.
+# $env:SANAE_TEXT_FALLBACK = 'deepseek'
 # GEMINI_API_KEY 不要写入此文件；生产环境请存入私有 secrets.json 的 gemini_api_key。
 # OpenAI 兼容适配：使用你的服务实际支持的模型；密钥放 secrets.json 的 gpt6luna_api_key。
 # $env:GPT6LUNA_BASE_URL = 'https://api.openai.com'
 # $env:GPT6LUNA_MODEL = 'YOUR_MODEL_ID'
 $env:SANAE_VISION_PROVIDER = 'zhipu' # zhipu / deepseek
 $env:ZHIPU_VISION_MODEL = 'glm-5.3-flash'
-$env:RELAY_G2S = '1'
+$env:RELAY_G2S = '0' # 状态/TPS 查询仍可用；按需显式开启聊天转发
 
 # Optional local media tools; leave unset when unused.
 # $env:LLBOT_BIN = "<LLBot bin directory>"
@@ -56,3 +62,12 @@ $env:RELAY_G2S = '1'
 # $env:SANAE_LEGACY_BACKUP_PIPELINE = '<backup pipeline script>'
 # $env:SANAE_MSLX_CONTROL_SCRIPT = '<MSLX control script>'
 # $env:SANAE_SHOP_MONITOR_ROOT = '<shop monitor data directory>'
+
+# Private archives: successful bot replies and incoming messages remain local.
+# $env:SOCIAL_REPLY_ARCHIVE = Join-Path $PSScriptRoot 'logs/reply-archive'
+$env:SOCIAL_REPLY_ARCHIVE_DAYS = '365'
+$env:SOCIAL_ARCHIVE_DAYS = '365'
+# Optional monitor destinations (empty/unset means no corresponding notification).
+# $env:LEGACY_CRASH_NOTIFY_GROUPS = $env:LLBOT_MANAGEMENT_GROUP
+# $env:LEGACY_LAG_ALERT_GROUPS = $env:LLBOT_MANAGEMENT_GROUP
+# $env:LEGACY_UPDATE_NOTIFY_GROUPS = $env:LLBOT_MANAGEMENT_GROUP

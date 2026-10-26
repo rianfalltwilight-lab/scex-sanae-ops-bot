@@ -63,7 +63,7 @@ class SilentVisionBridgeTests(FusionCase):
 
     def test_other_groups_self_and_commands_do_not_observe(self):
         with mock.patch.object(bridge, 'LLBOT_GROUPS', frozenset({bridge.SOCIAL_LITE_GROUP, 12345})):
-            for event in (self.photo(gid=12345), self.photo(uid='1002'), self.photo('!记忆')):
+            for event in (self.photo(gid=12345), self.photo(uid='1004'), self.photo('!记忆')):
                 self.handler._process_event(event)
         self.vision.observe.assert_not_called()
 

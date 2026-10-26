@@ -38,34 +38,34 @@ class SourceRecallTests(unittest.TestCase):
         return ids
 
     def test_mixed_authors_cannot_transfer_topic_or_summary_claim(self):
-        summary = "有人完善图片说明，并询问样例模组是否有能量API"
-        self.store([(1, "刚才完善测试图片说明"),
-                    (2, "说起来样例模组有和能量有关的API不")], summary)
+        summary = "有人改善识图，并询问奇点是否有动力API"
+        self.store([(1, "刚才改善早苗识图能力"),
+                    (2, "说起来奇点有和动力有关的API不")], summary)
         before = self.path.read_bytes()
-        self.assertEqual(self.mem.context(100, 1, "样例模组API"), "")
+        self.assertEqual(self.mem.context(100, 1, "奇点API"), "")
         first = self.mem.context(100, 1, "之前说过什么")
-        second = self.mem.context(100, 2, "样例模组API")
-        self.assertIn("完善测试图片说明", first)
-        self.assertNotIn("能量", first)
+        second = self.mem.context(100, 2, "奇点API")
+        self.assertIn("改善早苗识图能力", first)
+        self.assertNotIn("动力", first)
         self.assertNotIn(summary, first + second)
         self.assertIn("用户 2", second)
-        self.assertIn("样例模组有和能量有关的API不", second)
-        self.assertNotIn("完善测试图片说明", second)
+        self.assertIn("奇点有和动力有关的API不", second)
+        self.assertNotIn("改善早苗识图能力", second)
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_uncertainty_and_sleep_are_separate_people(self):
-        self.store([(1, "不知道"), (2, "睡了，明天整理笔记去了")],
-                   "有人表示不清楚，并说睡了、明天整理笔记")
+        self.store([(1, "不知道"), (2, "眠了，明天折磨模型去了")],
+                   "有人表示不清楚，并说眠了、明天折磨模型")
         context = self.mem.context(100, 1, "还记得我吗")
         self.assertIn('原话="不知道"', context)
-        self.assertNotIn("睡了", context)
-        self.assertNotIn("笔记", context)
+        self.assertNotIn("眠了", context)
+        self.assertNotIn("模型", context)
 
     def test_relevant_source_after_first_three_is_retrieved(self):
         self.store([(2, "下午晴天"), (2, "晚上吃饭"), (2, "天气凉快"),
-                    (1, "样例拼图还没开始")], "群友聊了一些事情")
-        context = self.mem.context(100, 1, "样例拼图")
-        self.assertIn('原话="样例拼图还没开始"', context)
+                    (1, "磁悬浮项目还没开始")], "群友聊了一些事情")
+        context = self.mem.context(100, 1, "磁悬浮项目")
+        self.assertIn('原话="磁悬浮项目还没开始"', context)
         self.assertNotIn("用户 2", context)
 
     def test_late_negation_kept_and_budget_skips_whole_source(self):

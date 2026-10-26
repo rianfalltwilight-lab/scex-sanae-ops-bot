@@ -1,42 +1,11 @@
 """Behavioural checks for optional current-message expression guidance."""
 
-import importlib.util
-import os
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sanae_persona import situational_expression_hint
-
-
-class PublicIdentityTests(unittest.TestCase):
-    def load(self, **settings):
-        spec = importlib.util.spec_from_file_location(
-            'identity_fixture', Path(__file__).resolve().parents[1] / 'sanae_identity.py')
-        identity = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(os.environ, settings, clear=True):
-            spec.loader.exec_module(identity)
-        return identity
-
-    def test_unconfigured_import_has_no_real_account(self):
-        identity = self.load()
-        self.assertEqual(identity.SANAE_QQ, '0')
-        self.assertEqual(identity.HISTORICAL_BOT_QQ, frozenset())
-
-    def test_legacy_environment_and_explicit_current_account(self):
-        self.assertEqual(self.load(SANAE_BOT_QQ='1002').SANAE_QQ, '1002')
-        identity = self.load(SANAE_QQ='1004', SANAE_BOT_QQ='1002',
-                             SANAE_HISTORICAL_BOT_QQ='1002,1003')
-        self.assertEqual(identity.SANAE_QQ, '1004')
-        self.assertEqual(identity.HISTORICAL_BOT_QQ, frozenset({'1002', '1003', '1004'}))
-
-    def test_non_numeric_identity_configuration_is_rejected(self):
-        with self.assertRaises(ValueError):
-            self.load(SANAE_QQ='not-an-account')
-        with self.assertRaises(ValueError):
-            self.load(SANAE_HISTORICAL_BOT_QQ='1002,bad')
 
 
 class SituationalExpressionHintTests(unittest.TestCase):

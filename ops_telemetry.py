@@ -24,6 +24,7 @@ from backup_verify import atomic_write_json as write_json
 from backup_verify import format_backup_verification, verify_latest_backups
 from mod_inventory import format_inventory, jar_signature, scan_installed_mods
 from ops_contract import append_jsonl, normalize_log_fingerprint
+from runtime_paths import default_path
 from recipe_index import (atomic_write_json as write_recipe_json, build_recipe_index,
                           format_recipe, query_recipes, recipe_signature, render_recipe_png)
 
@@ -137,11 +138,15 @@ def _format_error_digest(prefix, pending, interval):
 
 
 class OpsTelemetry:
-    def __init__(self, server_id, prefix, server_dir, state_base=None, query_fn=None):
+    def __init__(self, server_id, prefix, server_dir, state_base=None, query_fn=None,
+                 remote=False):
         self.server_id = str(server_id)
+        # Remote servers have no local logs, crash reports, backups or disk here.
+        self.remote = bool(remote)
         self.prefix = str(prefix)
         self.server_dir = Path(server_dir)
-        base = Path(state_base or Path(__file__).with_name("state") / "ops")
+        # The default is the live ops tree; offline tests get a temp tree.
+        base = Path(state_base or default_path("state", "ops"))
         self.root = base / self.server_id
         self.root.mkdir(parents=True, exist_ok=True)
         self.query_fn = query_fn

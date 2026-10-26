@@ -177,8 +177,9 @@ class StickerDeliveryTests(FusionCase):
         with mock.patch.object(bridge, 'split_social_reply', return_value=[self.BODY]):
             self.social()
         self.assertEqual(self.send.call_count, 2)
-        self.assertEqual(self.send.call_args_list[0].args[0], self.BODY.rstrip('。'))
-        self.assertTrue(self.send.call_args_list[1].args[0].startswith('[CQ:image,file='))
+        text, image = (call.args[0] for call in self.send.call_args_list)
+        self.assertNotIn('[CQ:image', text)
+        self.assertTrue(image.startswith('[CQ:image,file='))
         self.assert_sent_once()
 
     def test_social_segmented_image_failure_does_not_consume(self):

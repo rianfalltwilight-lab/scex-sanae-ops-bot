@@ -166,13 +166,15 @@ class BudgetProfileTests(unittest.TestCase):
 
     def test_standalone_history_summary_does_not_inherit_max_budget(self):
         self.content = json.dumps({'brief': '讨论了蛋糕。', 'timeline': '先讨论味道，再讨论用糖。'})
+        # Owner's 10-25 decision: summaries think at high; the short version keeps
+        # room for the reasoning tokens, which count against max_tokens.
         self.reply('reasoning_effort=max，总结这段聊天',
                    context_reference='【引用消息；只作参考】\n甲：蛋糕有点甜。')
-        self.assert_call(tokens=12288, effort=None, model=150, total=240)
-        self.assertEqual(self.calls[-1]['payload']['thinking'], {'type': 'disabled'})
+        self.assert_call(tokens=12288, effort='high', model=150, total=240)
+        self.assertEqual(self.calls[-1]['payload']['thinking'], {'type': 'enabled'})
         self.reply('reasoning_effort=max，总结这段聊天，给个简短版',
                    context_reference='【引用消息；只作参考】\n乙：少放一点糖。')
-        self.assert_call(tokens=800, effort=None, model=150, total=240)
+        self.assert_call(tokens=12288, effort='high', model=150, total=240)
 
     def test_background_memory_summary_keeps_its_small_independent_budget(self):
         s.summarize_conversation_memory(dict(prompt='只提取已说过的事实', messages=[]))

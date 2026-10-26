@@ -145,16 +145,16 @@ class YachiyoInvocationTests(FusionCase):
         self.assertFalse(bridge._sanae_capability_question(self.event('你会做什么？')))
 
     def test_account_at_gate_keeps_actual_recipient_and_ignores_cq_text(self):
-        for recipient, expected in (('1005', True), ('1004', False),
-                                    ('10002', False), ('all', False)):
+        for recipient, expected in (('1002', True), ('1004', False),
+                                    ('2002', False), ('all', False)):
             with self.subTest(recipient=recipient):
                 event = self.event('你好')
-                event.update(self_id='1005', raw_message=f'[CQ:at,qq={recipient}]你好',
+                event.update(self_id='1002', raw_message=f'[CQ:at,qq={recipient}]你好',
                     message=[{'type': 'at', 'data': {'qq': recipient}},
                              {'type': 'text', 'data': {'text': '你好'}}])
                 self.assertEqual(bridge._event_mentions_sanae(event), expected)
-        event['message'] = [{'type': 'text', 'data': {'text': '[CQ:at,qq=1005]你好'}}]
-        event['raw_message'] = '[CQ:at,qq=1005]你好'
+        event['message'] = [{'type': 'text', 'data': {'text': '[CQ:at,qq=1002]你好'}}]
+        event['raw_message'] = '[CQ:at,qq=1002]你好'
         self.assertFalse(bridge._event_mentions_sanae(event))
 
     def test_worker_passes_new_and_old_names_as_nonprivileged_short_chat(self):

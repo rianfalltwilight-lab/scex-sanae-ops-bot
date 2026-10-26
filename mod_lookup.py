@@ -12,6 +12,7 @@ import html
 import time
 import urllib.parse
 import urllib.request
+from public_errors import public_failure_label
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 
@@ -196,7 +197,7 @@ def lookup_cf(keyword):
         return f'CurseForge 搜索出错（HTTP {e.code}），稍后再试~'
     except Exception as e:
         print(f'[mod] CF API 搜索失败: {e}', flush=True)
-        return f'CurseForge 搜索出错（{e}），稍后再试~'
+        return f'CurseForge 搜索出错（{public_failure_label(e)}），稍后再试~'
     if not hits:
         return f'CurseForge 没找到「{keyword}」，换个关键词试试~'
     h = hits[0]

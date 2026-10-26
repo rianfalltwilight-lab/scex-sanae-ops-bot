@@ -64,6 +64,51 @@ def normalize_console_command(command):
     return value
 
 
+# Risk classes for console commands. "read" never changes the world; "low" is a
+# small, reversible change an admin may ask for in passing; everything else
+# needs a one-time confirmation code. The model may ask to confirm more, never less.
+_READ_COMMANDS = tuple(re.compile(pattern + r'$', re.I) for pattern in (
+    r'list(?: uuids)?', r'help(?: .+)?', r'seed', r'difficulty', r'gamerule [A-Za-z0-9_]+',
+    r'time query (?:day|daytime|gametime)', r'(?:neo)?forge tps(?: \S+)?', r'tps',
+    r'spark (?:health|tps)(?: --[a-z-]+)*', r'data get (?:entity|block|storage) [^;]{1,200}',
+    r'locate (?:structure|biome|poi) [a-z0-9_:#/.-]+',
+    r'scoreboard objectives list', r'scoreboard players (?:list|get) [^;]{1,120}',
+    r'team list(?: \S+)?', r'whitelist list', r'banlist(?: (?:ips|players))?',
+    r'forceload query(?: [^;]{1,60})?', r'worldborder get', r'datapack list(?: \S+)?',
+    r'(?:experience|xp) query \S+ (?:points|levels)', r'bossbar (?:list|get \S+ \S+)',
+    r'attribute \S+ \S+ (?:get|base get)(?: [\d.]+)?',
+    # Chunk loading and load sources (10-26): listings only, never add/remove/enable.
+    r'forceload query(?: -?\d+ -?\d+)?', r'execute in [a-z0-9_.-]+:[a-z0-9_./-]+ run forceload query(?: -?\d+ -?\d+)?',
+    r'neoforge (?:dimensions|tps(?: [a-z0-9_.-]+:[a-z0-9_./-]+)?)', r'neoforge entity list(?: "[a-z0-9_.-]+:[a-z0-9_./-]+")?',
+    r'mio_icif (?:chunkloaders|perf)', r'warashi loader frozen list', r'chunky progress',
+    # ServerCore counters and the research listing (10-26): read-only listings.
+    r'statistics(?: (?:entities|block-entities)(?: (?:byType|byPlayer))?(?: \d{1,3})?)?', r'servercore status',
+    r'thaumcraft research list',
+    # Round 14: tick percentiles, the entity limiter's status, timing results (not `track start`).
+    r'tick query', r'chesirtab status', r'neoforge track (?:blockentity|entity)',
+))
+_LOW_COMMANDS = tuple(re.compile(pattern + r'$', re.I) for pattern in (
+    r'weather (?:clear|rain|thunder)(?: \d{1,6})?',
+    r'time (?:set (?:day|night|noon|midnight|\d{1,7})|add \d{1,7})',
+    r'say [^\r\n]{1,256}',
+))
+
+
+def classify(command):
+    """'read', 'low' or 'confirm' for one console command (no leading slash)."""
+    try:
+        value = normalize_console_command(command)
+    except ValueError:
+        return 'confirm'
+    if re.search(r'[;&|`$<>]', value) and not value.lower().startswith('say '):
+        return 'confirm'
+    if any(pattern.match(value) for pattern in _READ_COMMANDS):
+        return 'read'
+    if any(pattern.match(value) for pattern in _LOW_COMMANDS):
+        return 'low'
+    return 'confirm'
+
+
 def command_token(command):
     value = normalize_console_command(command)
     first = value.split(None, 1)[0]

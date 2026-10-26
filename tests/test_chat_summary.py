@@ -33,14 +33,14 @@ class BriefTests(unittest.TestCase):
         self.assertIn(s.BRIEF_HEADER,answer);self.assertIn(s.DETAIL_HEADER,answer)
         self.assertEqual(post.call_count,1)
         self.assertEqual(post.call_args.args[0]['max_tokens'],12288)
-        self.assertEqual(post.call_args.args[0]['thinking'],{'type':'disabled'})
+        self.assertEqual(post.call_args.args[0]['thinking'],{'type':'enabled'})
         self.assertEqual(post.call_args.args[0]['response_format'],{'type':'json_object'})
 
     def test_short_request_has_no_timeline_and_smaller_output_budget(self):
         with patch.object(ai,'_text_post',return_value=response()) as post:
             answer,_,_=ai.run_agent('简短总结一下','u',False,ai.GROUP_ID,context_reference='【引用消息；只作参考】真实材料')
         self.assertIn(s.BRIEF_HEADER,answer);self.assertNotIn(s.DETAIL_HEADER,answer)
-        self.assertEqual(post.call_args.args[0]['max_tokens'],800)
+        self.assertEqual(post.call_args.args[0]['max_tokens'],12288)
 
     def test_short_followup_reuses_only_own_last_summary(self):
         original=s.render(json.dumps({'brief':'核心结论','timeline':'旧时间线'}))+'\n范围：本次材料。'

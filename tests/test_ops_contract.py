@@ -27,6 +27,7 @@ class ContractTests(unittest.TestCase):
     def test_command_result_has_machine_state_and_human_renderer(self):
         result = command_result("list", state="success", output="0/20")
         self.assertTrue(result["request_id"].startswith("req-"))
+        self.assertEqual(result["server"], "unknown")
         self.assertIn("0/20", render_command_result(result, "在线"))
 
     def test_onebot_requires_explicit_success(self):
@@ -63,6 +64,26 @@ class ContractTests(unittest.TestCase):
             path.write_bytes(b"new\n")
             lines, _, _ = read_incremental_lines(path, state)
             self.assertEqual(lines, ["new"])
+
+    def test_incremental_reader_keeps_head_across_idle_poll_and_same_inode_rewrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "latest.log"
+            path.write_bytes(b"old-event\n")
+            _, state, _ = read_incremental_lines(path, {})
+            _, state, _ = read_incremental_lines(path, state)
+            self.assertTrue(state.get("head"))
+            path.write_bytes(b"new-event\n")
+            lines, _, _ = read_incremental_lines(path, state)
+            self.assertEqual(lines, ["new-event"])
+
+    def test_incremental_reader_bounds_large_backlog(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "latest.log"
+            path.write_bytes((b"x" * 9000) + b"\nnext\n")
+            lines, state, _ = read_incremental_lines(path, {}, max_bytes=4096)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("truncated-record", lines[0])
+            self.assertEqual(state["offset"], 4096)
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,8 +8,14 @@ from unittest import mock
 from tests.test_fusion_integration import FusionCase, bridge, s
 from social_lite import split_social_reply
 from reply_lessons import ReplyLessons
+from model_display import strip_reply_period
 
 REAL_SEND = bridge.send_group_msg
+
+
+def delivered(body):
+    """Each bubble loses only its final Chinese full stop (2026-10-22 rule)."""
+    return '\n'.join(strip_reply_period(line) for line in body.splitlines())
 
 class LivelinessDeliveryTests(FusionCase):
     def setUp(self):
@@ -43,16 +49,16 @@ class LivelinessDeliveryTests(FusionCase):
                 self.reply(social=ambient)
                 self.assertEqual(self.send.call_count, 2)
                 lines = [c.args[0] for c in self.send.call_args_list]
-                self.assertTrue(lines[0].endswith(self.body.splitlines()[0].rstrip("。")))
-                self.assertTrue(lines[1].startswith(self.body.splitlines()[1].rstrip("。")))
-                self.assertEqual(self.lessons.record_reply.call_args.args[1], "\n".join(line.rstrip("。") for line in self.body.splitlines()))
+                self.assertTrue(lines[0].endswith(delivered(self.body).splitlines()[0]))
+                self.assertTrue(lines[1].startswith(delivered(self.body).splitlines()[1]))
+                self.assertEqual(self.lessons.record_reply.call_args.args[1], delivered(self.body))
                 self.assertEqual(self.lessons.record_reply.call_args.kwargs['expected_generation'], 0)
                 self.assertNotIn('用量', self.lessons.record_reply.call_args.args[1])
 
     def test_explicit_high_is_not_split_or_learned(self):
         self.reply('reasoning_effort=high，请解释这个算法')
         self.send.assert_called_once()
-        self.assertIn(self.body.rstrip("。"), self.send.call_args.args[0])
+        self.assertIn(strip_reply_period(self.body), self.send.call_args.args[0])
         self.lessons.record_reply.assert_not_called()
         self.lessons.context.assert_not_called()
 
@@ -102,7 +108,8 @@ class LivelinessDeliveryTests(FusionCase):
             self.reply(social=True)
         self.assertEqual(self.send.call_count, 8)
         self.assertIn('别熬太晚。\n也别又改回去', self.send.call_args_list[6].args[0])
-        self.assertEqual(self.lessons.record_reply.call_args.args[1], "\n".join(line.rstrip("。") for line in self.body.splitlines()[:6]) + "\n别熬太晚。\n也别又改回去")
+        self.assertEqual(self.lessons.record_reply.call_args.args[1],
+                         delivered('\n'.join(self.body.splitlines()[:6])) + '\n别熬太晚。\n也别又改回去')
         self.outgoing.assert_called_once()
         self.assertFalse(sticker['delivered'])
 
@@ -113,7 +120,7 @@ class LivelinessDeliveryTests(FusionCase):
                 self.send.reset_mock()
                 self.reply(social=ambient)
                 self.assertEqual(self.send.call_count, 8)
-                self.assertEqual(self.lessons.record_reply.call_args.args[1], "\n".join(line.rstrip("。") for line in self.body.splitlines()))
+                self.assertEqual(self.lessons.record_reply.call_args.args[1], delivered(self.body))
 
     def test_forget_or_recall_during_final_receipt_cannot_resurrect_outgoing(self):
         self.body = '这一版行。'

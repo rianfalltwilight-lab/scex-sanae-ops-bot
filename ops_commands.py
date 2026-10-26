@@ -15,13 +15,13 @@ from backup_verify import format_backup_verification
 from mod_inventory import format_inventory, format_inventory_pages
 from ops_contract import append_jsonl
 from ops_telemetry import OpsTelemetry
+from runtime_paths import default_path
 from recipe_index import format_recipe, query_recipes, render_recipe_png
 from server_registry import (extract_server_selector, get_group_default, get_selected,
                              server_prefix, server_hint)
 
 
-STATE_BASE = Path(os.environ.get(
-    "OPS_STATE_BASE", str(Path(__file__).with_name("state") / "ops")))
+STATE_BASE = Path(os.environ.get("OPS_STATE_BASE", default_path("state", "ops")))
 IMAGE_WSL_DIR = Path(os.environ.get(
     "OPS_RECIPE_IMAGE_DIR", str(Path(__file__).with_name("state") / "ops-images")))
 IMAGE_WINDOWS_DIR = os.environ.get("OPS_RECIPE_IMAGE_WINDOWS_DIR", str(IMAGE_WSL_DIR))
@@ -79,7 +79,8 @@ def _telemetry(server, query_fn=None):
     server_dir = server.get("server_dir") or "/nonexistent/remote/" + server["id"]
     wrapped = (lambda command: query_fn(server, command)) if query_fn else None
     return OpsTelemetry(server["id"], server_prefix(server), server_dir,
-                        state_base=STATE_BASE, query_fn=wrapped)
+                        state_base=STATE_BASE, query_fn=wrapped,
+                        remote=bool(server.get("remote_ssh_host")))
 
 
 def _audit(name, server, user_id, state="success", detail=""):
@@ -146,6 +147,12 @@ def dispatch_ops_command(raw, group_id, user_id, privileged, query_fn=None):
         elif name == "errors":
             window = command["match"].group(1) or "6h"
             reply = OpsReply(_error_summary(telemetry, window))
+        elif name in ("lag", "backup") and server.get("remote_ssh_host"):
+            # The old local snapshots would look current; say what is possible instead.
+            reply = OpsReply(
+                "%s 服务器在远端主机，本机不能做卡顿取证；可用 !时间线 或 !错误摘要 查看已记录的事件。" %
+                telemetry.prefix if name == "lag" else
+                "%s 服务器在远端主机，它的备份不在本机，这里无法校验。" % telemetry.prefix)
         elif name == "lag":
             arg = (command['match'].group(1) or '').strip()
             if arg not in ('', '最新', 'latest'):

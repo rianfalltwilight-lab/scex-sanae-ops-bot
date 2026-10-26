@@ -12,7 +12,7 @@
 [`i0czf/minecraft-server-ops-kit`](https://github.com/i0czf/minecraft-server-ops-kit)，
 本仓库是面向 SCEX 真实生产环境的特化与重写版本，不是上游官方发行版。
 
-最新源码同步：[2026-10-25 更新说明、配置与验证边界](docs/UPDATE-20261025.md)。
+最新源码同步：[2026-10-26 更新说明、配置与验证边界](docs/UPDATE-20261026.md)。
 
 ## 它解决什么问题
 
@@ -34,11 +34,12 @@
 - **BlueMap 截图**：按服务器和玩家定位，检查在线列表、网页 HTTP、PNG 与 OneBot 发送结果。
 - **模组与配方**：Modrinth、CurseForge、百科检索、服务端命令目录与配方索引。
 - **拟人闲聊**：当前角色名为八千代，保留“早苗”称呼；支持连续短消息合并、更正替换、倾听偏好和过期回复取消，默认需要 @。
-- **轻量学习闭环**：按群和用户隔离个人记忆，支持来源回溯、记住与忘记；从成功送达的回复及有来源反馈学习表达，保留黑话与主题记忆。
+- **记忆与回复经验**：按群和用户隔离个人记忆，支持来源回溯、记住与忘记；区分群友原话、转发和助手旧回复。保留持续事件与说话心得，表达学习可独立关闭，旧黑话学习层已移除。
 - **贴纸策略**：按开心、无语、拒绝、震惊、道歉、撒娇等语义选择素材，带冷却与单次上限；素材本身不随仓库分发。
 - **聊天回溯与总结**：从实际可读引用和聊天样本生成短总结及完整时间线，支持同范围缓存短版。
 - **媒体理解**：解析 OneBot 图片/引用消息，可选视觉模型描述和短期静默看图；文件大小、来源与下载路径受限制。
 - **网络与远程运维**：`!ping` / `!ping full` 有界网络诊断、Windows/POSIX 远程日志、可配置备份与 MSLX 控制、店铺监控快照查询。
+- **服务器资料与问题反馈**：读取已配置服务的模组、配方、任务、研究及世界统计，提供 `!bug` 问题台账、远程周报和可选管理通知；坐标等细节保留权限限制。
 - **UTF-8 通路**：JSON `ensure_ascii=False`、UTF-8 字节与 BOM 兼容，避免中文经过嵌套 PowerShell 命令后乱码。
 
 详细数据流见 [架构说明](docs/ARCHITECTURE.md)。
@@ -76,14 +77,16 @@ Copy-Item .\start.example.ps1 .\start.ps1
 - `qq-admins.json`：owner 和管理员；
 - `env.ps1`：OneBot API、目标群、机器人 QQ 和开关。
 
-文本模型支持 DeepSeek、原生 Gemini `generateContent` 和 `gpt6luna` 命名的 OpenAI 兼容适配。
+文本模型支持 DeepSeek、原生 Gemini 流式及 `generateContent` 接口，和 `gpt6luna` 命名的 OpenAI 兼容适配。
 模型标识需匹配所用服务。切换 Gemini 时把
 `SANAE_TEXT_PROVIDER` 设为 `gemini`，配置 `GOOGLE_GEMINI_BASE_URL`、`GEMINI_MODEL` 和
 `GEMINI_THINKING_LEVEL`，并只在未跟踪的 `secrets.json` 中保存 `gemini_api_key`。代码不会在
-Gemini 失败时偷偷回落到另一个 provider。OpenAI 兼容适配使用 `GPT6LUNA_BASE_URL`、
+未配置时跨 provider 回落。显式设置 `SANAE_TEXT_FALLBACK=deepseek` 后，符合条件的首次调用
+失败可回落到 DeepSeek；已经执行工具的轮次不从头重放。OpenAI 兼容适配使用 `GPT6LUNA_BASE_URL`、
 `GPT6LUNA_MODEL` 和私有 `gpt6luna_api_key`。
 
-多群、记忆、静默看图和远程服务配置见[本次更新说明](docs/UPDATE-20261025.md)。
+多群、记忆、静默看图和远程服务的基础配置见[前次说明](docs/UPDATE-20261025.md)，
+新增开关见[本次更新说明](docs/UPDATE-20261026.md)。
 
 先在测试群和测试服验证，再运行：
 
@@ -102,12 +105,15 @@ python scripts/test-offline.py
 
 - `llbot_bridge.py`：OneBot 上报入口和总路由；
 - `sanae_ai.py`：早苗角色卡、模型调用、自然语言工具与视觉路径；
-- `social_*.py`、`slang_learner.py`、`sticker_catalog.py`：轻量社交状态；
+- `social_*.py`、`sticker_catalog.py`：轻量社交状态与贴纸；
 - `conversation_*.py`、`expression_memory.py`、`reply_lessons.py`：对话轮次、个人记忆和回复经验；
 - `sanae_identity.py`、`sanae_persona.py`、`silent_vision.py`：身份、角色和静默图片观察；
 - `server_registry.py`、`rcon_*.py`：多服注册表与 RCON 安全执行；
 - `legacy_monitor.py`、`advancement_localization.py`：SCEX 怀旧服事件与成就本地化；
 - `ops_*.py`：运维快照、遥测和确定性查询；
+- `server_insight.py`、`player_progress.py`、`world_status.py`、`world_records.py`：服务、玩家及世界查询；
+- `remote_*reader.py`、`remote_mods_mirror.py`、`server_watch.py`：已配置远程服务的采集与观察；
+- `bug_reports.py`、`maintenance/`：问题台账、配置审计与备份维护工具；
 - `tests/`：离线安全、路由、去重、UTF-8、学习与运维测试。
 
 ## 上游、AI 与许可

@@ -13,12 +13,14 @@ import time
 
 import chat_recall
 import context_policy as limits
+from sanae_identity import HISTORICAL_BOT_QQ
 from request_runtime import remaining_timeout
 
 
 MAX_CALLS = 32
 MAX_TEXT = 24000
 MAX_REPLY_DEPTH = 2
+MAX_HISTORY_FORWARDS = 6
 _CQ = re.compile(r"\[CQ:([a-z_]+)((?:,[^\]]*)?)\]", re.I)
 
 
@@ -205,9 +207,13 @@ class _Reader:
                 when = datetime.fromtimestamp(stamp, chat_recall.TZ).isoformat()
             except (ValueError, OverflowError, OSError):
                 pass
+        nickname = str(sender.get('card') or sender.get('nickname') or '群友')[:80]
+        # Without self-attribution the bot can take its own quoted
+        # character card for a member's work (10-26 16:16).
+        if str(row.get('user_id') or sender.get('user_id') or '') in HISTORICAL_BOT_QQ:
+            nickname += '（八千代本人：这是你自己之前发的消息）'
         return {'message_id': row.get('message_id'), 'message_seq': row.get('message_seq'),
-                'time': stamp, 'timestamp': when,
-                'nickname': str(sender.get('card') or sender.get('nickname') or '群友')[:80],
+                'time': stamp, 'timestamp': when, 'nickname': nickname,
                 'text': self.text(row, depth)}
 
 
@@ -235,6 +241,44 @@ def _result(reader, messages, coverage, **extra):
                        **extra}, ensure_ascii=False)
 
 
+def _expand_history_forwards(reader, rows, limit=MAX_HISTORY_FORWARDS):
+    """Attach readable text to the newest rows that carry a forwarded chat record.
+
+    Only forward IDs discovered in this group's verified history are read, and
+    the reader's shared call and time limits still apply.
+    """
+    done = 0
+    for row in reversed(rows):
+        if done >= limit:
+            break
+        ids = []
+        for segment in _segments(_content(row)):
+            data = segment.get('data') or {}
+            if segment.get('type') == 'forward' and isinstance(data, dict):
+                identifier = str(data.get('id') or data.get('res_id') or '')
+                if identifier in reader.forward_ids and identifier not in reader.expanded:
+                    ids.append(identifier)
+        texts = []
+        for identifier in ids[:2]:
+            reader.expanded.add(identifier)
+            info = {}
+            try:
+                value = chat_recall.expand_forward(reader.api, identifier,
+                                                    api_reader=reader.api_reader, diagnostics=info)
+            except Exception:
+                reader.warn('部分合并转发读取失败或达到展开上限')
+                continue
+            if info.get('failures') or info.get('truncated'):
+                reader.warn('部分合并转发读取失败或达到展开上限')
+            compact = chat_recall.compact_forward(value)
+            if compact:
+                texts.append(compact)
+        if texts:
+            row['_forward_text'] = ' / '.join(texts)
+            done += 1
+    return done
+
+
 def fetch_group_rows(api_url, group_id):
     """Return verified raw rows and coverage for existing chat statistics.
 
@@ -248,6 +292,7 @@ def fetch_group_rows(api_url, group_id):
                                       diagnostics=info, api_reader=reader.api_reader)
         if info.get('failures'):
             reader.warn('后续历史分页读取失败；当前仅保留成功读取的页面')
+        info['forwards_expanded'] = _expand_history_forwards(reader, rows)
         info.update(group_id=reader.group_id, api_calls=reader.calls,
                     complete_history=False, warnings=list(reader.warnings))
         return rows, info

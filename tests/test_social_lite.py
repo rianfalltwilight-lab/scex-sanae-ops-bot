@@ -27,7 +27,8 @@ class _Response:
 
 class SocialLiteTests(unittest.TestCase):
     def make(self, **kwargs):
-        # Keep synthetic fixture files in this public checkout and remove them.
+        # The production workspace is writable in the Windows service account;
+        # use it for the fixture because this runner may deny %TEMP% writes.
         temp = tempfile.TemporaryDirectory(prefix='social-lite-', dir=str(Path(__file__).resolve().parents[1]))
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
@@ -110,10 +111,10 @@ class SocialLiteTests(unittest.TestCase):
             return _Response({'status': 'ok', 'retcode': 0, 'data': None})
 
         with mock.patch('social_lite.urllib.request.urlopen', fake_open):
-            actions.mute(1001, 2001, 300)
+            actions.mute(1001, 2003, 300)
         self.assertTrue(seen['url'].endswith('/set_group_ban'))
         self.assertEqual(seen['body'], {
-            'group_id': 1001, 'user_id': 2001, 'duration': 300})
+            'group_id': 1001, 'user_id': 2003, 'duration': 300})
 
     def test_expression_style_hint_is_derived_and_decisional(self):
         social = self.make()

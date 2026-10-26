@@ -140,7 +140,7 @@ class NaturalChatPolicyTests(unittest.TestCase):
         for payload in sent:
             self.assertEqual(payload['thinking'], {'type': 'disabled'})
             self.assertNotIn('reasoning_effort', payload)
-            self.assertEqual(payload['tools'], [s.RUN_RCON_RO])
+            self.assertEqual(payload['tools'], [s.RUN_RCON_RO] + s.SERVER_INFO_TOOLS + [s.LIST_MODS])
             self.assertNotIn(s.SANAE_CHAT_SAFETY_POLICY, payload['messages'][0]['content'])
         self.assertIn('269', answer)
 

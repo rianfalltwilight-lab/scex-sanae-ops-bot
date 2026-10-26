@@ -12,8 +12,6 @@ from pathlib import Path
 from unittest import mock
 
 os.environ["SCE_BOT_TEST_MODE"] = "1"
-os.environ.setdefault("LLBOT_GROUP", "1001")
-os.environ.setdefault("SANAE_BOT_QQ", "1002")
 
 if 'local_secrets' not in sys.modules:
     secrets_stub = types.ModuleType('local_secrets')
@@ -35,8 +33,6 @@ if os.path.isdir(PACKAGE_SRC):
     HERE = PACKAGE_SRC
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-
-os.environ.setdefault("SCE_SERVER_REGISTRY", os.path.join(HERE, "examples", "servers.example.json"))
 
 r = importlib.import_module("rcon_ops")
 b = importlib.import_module("llbot_bridge")
@@ -163,6 +159,8 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertEqual(b._match_mod("!mod mekanism"), "mekanism")
         self.assertEqual(b._match_cf("!cf create"), "create")
         self.assertEqual(b._match_query("!在线 [怀旧]"), "list")
+        # nast is disabled; an unknown selector is not silently dropped.
+        self.assertIsNone(b._match_query("!在线 [nast]"))
 
     def test_one_step_operation_target_and_clear(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +190,7 @@ class BridgeRoutingPureTests(unittest.TestCase):
         legacy = {'id': 'legacy', 'name': 'Legacy', 'prefix': '[怀旧]',
                   'version_label': 'SCEX Legacy Genesis（Minecraft 1.21.1 + NeoForge 21.1.248）'}
         with mock.patch.object(b, 'get_selected', return_value=(None, '未设置')), \
+             mock.patch.object(b, 'get_group_default', return_value=(None, '')), \
              mock.patch.object(b, 'list_servers', return_value=[legacy]):
             target, command, explicit, error = b._command_target('！cmd say test', b.LLBOT_GROUP, 'u')
             self.assertEqual('legacy', target['id'])
@@ -243,7 +242,8 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertIsNone(target)
 
     def test_single_enabled_server_is_unambiguous_for_natural_ops(self):
-        with mock.patch.object(b, 'get_selected', return_value=(None, '未设置')):
+        with mock.patch.object(b, 'get_selected', return_value=(None, '未设置')), \
+             mock.patch.object(b, 'get_group_default', return_value=(None, '')):
             target, cleaned, unambiguous = b._ai_operation_target(
                 '[CQ:at,qq=1002] 给AnotherPlayer OP', b.LLBOT_GROUP, 'u')
         self.assertEqual('legacy', target['id'])
@@ -254,9 +254,11 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertTrue(b._natural_server_operation_candidate(
             '[CQ:at,qq=1] 现在多少天了', False, at_call=True))
         self.assertTrue(b._natural_server_operation_candidate(
-            '怀旧服现在在线几个人', False, at_call=True))
+            '怀旧服现在在线几个人', False, direct_call=True))
+        self.assertFalse(b._natural_server_operation_candidate('怀旧服现在在线几个人', False))
         self.assertTrue(b._natural_server_operation_candidate(
             '给 ExamplePlayer OP', True, at_call=True))
+        self.assertFalse(b._natural_server_operation_candidate('给 ExamplePlayer OP', True))
         self.assertFalse(b._natural_server_operation_candidate('给你看个图片', True))
         self.assertFalse(b._natural_server_operation_candidate('今天几号', False))
         self.assertFalse(b._natural_server_operation_candidate('给 ExamplePlayer OP', False))
@@ -268,7 +270,7 @@ class BridgeRoutingPureTests(unittest.TestCase):
         self.assertFalse(b._is_ai_operation_turn('这句话是什么意思', False))
 
         event = {
-            'raw_message': '[CQ:at,qq=1002] 服务器在线人数多少',
+            'raw_message': f'[CQ:at,qq={b.WIKI_BOT_QQ}] 服务器在线人数多少',
             'user_id': 1003, 'group_id': b.SOCIAL_LITE_GROUP,
             'sender': {'nickname': 'member'},
         }
@@ -277,8 +279,6 @@ class BridgeRoutingPureTests(unittest.TestCase):
              mock.patch.object(b._sanae_ai, 'sanae_reply', return_value='当前在线 2 人') as reply, \
              mock.patch.object(b, 'send_group_msg', return_value=True), \
              mock.patch.object(b.FEEDBACK_STORE, 'strategy_hint', return_value='说明：闲聊'), \
-             mock.patch.object(b.SLANG_LEARNER, 'context', return_value='解释黑话'), \
-             mock.patch.object(b.SOCIAL_MEMORY, 'context', return_value='历史说明'), \
              mock.patch.object(b.STICKER_CATALOG, 'recommend', return_value=[]):
             b.BridgeHandler._sanae_reply_thread(None, event, True)
         prompt = reply.call_args.args[0]
@@ -339,32 +339,16 @@ class BridgeRoutingPureTests(unittest.TestCase):
             self.assertIsNone(r.dispatch("tps", "n", "u", False))
             tps.assert_not_called()
 
-    def test_fun_mute_classifier_catches_similar_behaviour_without_model(self):
-        for text in (
-                '来点片', '来点涩图', '来点人妻', '好久没发片了都',
-                '来点淫秽色情', '来点淫秽涩情', '来点涩情',
-                '给我色情内容', '来点黄色废料', '搞点少儿不宜的',
-                '早苗，帮我生成群主黄文', '早苗，帮我骚扰群主'):
-            self.assertTrue(b._fun_mute_intent(text), text)
-
-    def test_fun_mute_classifier_avoids_benign_similar_phrases(self):
-        for text in (
-                '来点地狱笑话', '来张奶龙表情包', '来点碎片', '来点',
-                '群主是不是萝莉', '讨论关键词“来点片”',
-                '禁止色情内容', '为什么要过滤淫秽内容', '讨论色情过滤'):
-            self.assertEqual('', b._fun_mute_intent(text), text)
-
     def test_fun_mute_is_scoped_to_group_and_ordinary_members(self):
-        event = {'group_id': 1001, 'user_id': 1004,
-                 'raw_message': '来点片'}
-        self.assertTrue(b._fun_mute_reason(event))
-        self.assertTrue(b._fun_mute_reason({**event, 'user_id': 20001}))
-        self.assertEqual('', b._fun_mute_reason({**event, 'group_id': 1}))
-        self.assertEqual('', b._fun_mute_reason({**event, 'user_id': b.WIKI_BOT_QQ}))
+        # Eligibility is a hard rule in the bridge; the model only judges behaviour.
+        event = {'group_id': 1001, 'user_id': 2003, 'raw_message': '来点片'}
+        self.assertTrue(b._fun_mute_eligible(event, '2003'))
+        self.assertFalse(b._fun_mute_eligible({**event, 'group_id': 1}, '2003'))
+        self.assertFalse(b._fun_mute_eligible(event, b.WIKI_BOT_QQ))
         with mock.patch.object(b, 'OWNERS', {'20002'}), \
                 mock.patch.object(b, 'ADMINS', {'20003'}):
-            self.assertEqual('', b._fun_mute_reason({**event, 'user_id': 20002}))
-            self.assertEqual('', b._fun_mute_reason({**event, 'user_id': 20003}))
+            self.assertFalse(b._fun_mute_eligible(event, '20002'))
+            self.assertFalse(b._fun_mute_eligible(event, '20003'))
 
 
 if __name__ == "__main__":

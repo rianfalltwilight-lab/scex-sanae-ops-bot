@@ -82,7 +82,7 @@ class AccountIdentityTests(unittest.TestCase):
             prefix="account-identity-", dir=ROOT.parent)))
         stack.enter_context(mock.patch.dict(os.environ, {
             "SANAE_QQ": NEW_QQ,
-            "SANAE_BOT_QQ": PREVIOUS_QQ,
+            "SANAE_BOT_QQ": NEW_QQ,
             "SANAE_HISTORICAL_BOT_QQ": ",".join((OLD_QQ, PREVIOUS_QQ, NEW_QQ)),
             "SCE_BOT_TEST_MODE": "1",
             "SCE_SERVER_REGISTRY": str(self.temp / "empty-registry.json"),
@@ -118,7 +118,7 @@ class AccountIdentityTests(unittest.TestCase):
                 else:
                     os.environ["SANAE_QQ"] = configured
                 identity = importlib.import_module("sanae_identity")
-                current = configured or PREVIOUS_QQ
+                current = configured or NEW_QQ
                 self.assertEqual(identity.SANAE_QQ, current)
                 self.assertEqual(set(identity.HISTORICAL_BOT_QQ), {OLD_QQ, PREVIOUS_QQ, NEW_QQ, current})
                 bridge, ai = self.gates()
@@ -162,7 +162,8 @@ class AccountIdentityTests(unittest.TestCase):
         bridge = load_source("llbot_bridge.py", methods=(("BridgeHandler", "_process_event"),),
             REPLY_GROUP=mock.Mock(), LLBOT_GROUP=GROUP_ID, SOCIAL_LITE_GROUP=GROUP_ID,
             _shop_query=types.SimpleNamespace(is_query=lambda _: False),
-            _bridge_group_enabled=lambda _: True, _start_worker=start_worker, print=mock.Mock())
+            _bridge_group_enabled=lambda _: True, _start_worker=start_worker, print=mock.Mock(),
+            PRIVATE_FORWARD_ENABLED=True)
         for message_type in ("private", "group"):
             for uid, self_id in ((OLD_QQ, NEW_QQ), (PREVIOUS_QQ, NEW_QQ), (int(NEW_QQ), NEW_QQ),
                                  (NEW_QQ, int(NEW_QQ)), (OTHER_QQ, int(OTHER_QQ))):
@@ -173,6 +174,11 @@ class AccountIdentityTests(unittest.TestCase):
         incoming = event(message_type="private")
         bridge["_process_event"](handler, incoming)
         start_worker.assert_called_once_with(handler._forward_private, args=(incoming,))
+        # Production switches forwarding off: private messages are then ignored.
+        start_worker.reset_mock()
+        bridge["PRIVATE_FORWARD_ENABLED"] = False
+        bridge["_process_event"](handler, incoming)
+        start_worker.assert_not_called()
 
     def test_social_mentions_replies_and_self_filter_follow_instance_identity(self):
         SocialLite = importlib.import_module("social_lite").SocialLite
@@ -202,6 +208,7 @@ class AccountIdentityTests(unittest.TestCase):
         ExpressionMemory = importlib.import_module("expression_memory").ExpressionMemory
         wired = load_source("llbot_bridge.py", names=("CONVERSATION_MEMORY", "EXPRESSION_MEMORY"),
             _os=os, _BRIDGE_DIR=str(self.temp), SOCIAL_LITE_GROUP=GROUP_ID,
+            _default_path=lambda *parts: os.path.join(str(self.temp), *parts),
             ConversationMemory=ConversationMemory, ExpressionMemory=ExpressionMemory)
         for name in ("CONVERSATION_MEMORY", "EXPRESSION_MEMORY"):
             memory = wired[name]
@@ -239,6 +246,7 @@ class AccountIdentityTests(unittest.TestCase):
         ReplyLessons = importlib.import_module("reply_lessons").ReplyLessons
         wired = load_source("llbot_bridge.py", names=("REPLY_LESSONS",),
             _os=os, _BRIDGE_DIR=str(self.temp), SOCIAL_LITE_GROUP=GROUP_ID,
+            _default_path=lambda *parts: os.path.join(str(self.temp), *parts),
             ReplyLessons=lambda *args, **kwargs: ReplyLessons(*args, **kwargs, clock=lambda: NOW))
         lessons = wired["REPLY_LESSONS"]
         self.assertEqual(lessons.bot_user_ids, {OLD_QQ, PREVIOUS_QQ, NEW_QQ})
@@ -339,6 +347,7 @@ class AccountIdentityTests(unittest.TestCase):
                 self.assertEqual(ai["is_at_sanae"](raw), expected)
             wired = load_source("llbot_bridge.py", names=("CONVERSATION_MEMORY", "EXPRESSION_MEMORY"),
                 _os=os, _BRIDGE_DIR=str(self.temp), SOCIAL_LITE_GROUP=GROUP_ID,
+            _default_path=lambda *parts: os.path.join(str(self.temp), *parts),
                 ConversationMemory=importlib.import_module("conversation_memory").ConversationMemory,
                 ExpressionMemory=importlib.import_module("expression_memory").ExpressionMemory)
             for memory in (wired["CONVERSATION_MEMORY"], wired["EXPRESSION_MEMORY"]):
@@ -347,6 +356,15 @@ class AccountIdentityTests(unittest.TestCase):
                     self.assertFalse(memory.observe(event("我喜欢咖啡", uid=uid, self_id=PREVIOUS_QQ)))
                 self.assertFalse(memory.path.exists())
                 self.assertTrue(memory.observe(event("我喜欢咖啡", self_id=PREVIOUS_QQ)))
+
+    def test_public_launcher_requires_local_account_configuration(self):
+        launcher = (ROOT / "start.example.ps1").read_text(encoding="utf-8-sig")
+        config = (ROOT / "examples/env.example.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("env.ps1", launcher)
+        self.assertRegex(config, r"(?m)^\s*\$env:SANAE_BOT_QQ\s*=\s*'YOUR_BOT_QQ'\s*$")
+        self.assertIn("SANAE_HISTORICAL_BOT_QQ", config)
+        for account in (OLD_QQ, PREVIOUS_QQ, NEW_QQ):
+            self.assertNotRegex(config, r"['\"]" + account + r"['\"]")
 
 
 

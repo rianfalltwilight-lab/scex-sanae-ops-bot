@@ -15,11 +15,17 @@ from unittest import mock
 
 
 os.environ['SCE_BOT_TEST_MODE'] = '1'
+# The bridge's default activity log is the production one; tests must never
+# append synthetic replies there.
+_TEST_ACTIVITY_LOG = Path(os.environ.get('SOCIAL_LITE_ACTIVITY', Path(tempfile.gettempdir()) / 'sanae-test-social-activity.log'))
+os.environ.setdefault('SOCIAL_LITE_ACTIVITY', str(_TEST_ACTIVITY_LOG))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 with mock.patch.object(socket.socket, 'connect', side_effect=AssertionError('network disabled')):
     s = importlib.import_module('sanae_ai')
     bridge = importlib.import_module('llbot_bridge')
     persona = importlib.import_module('sanae_persona')
+# Another test module may have imported the bridge first.
+bridge.SOCIAL_LITE.activity_path = _TEST_ACTIVITY_LOG
 
 
 class FusionCase(unittest.TestCase):
@@ -50,11 +56,6 @@ class FusionCase(unittest.TestCase):
         self.recent_clear = self.stack.enter_context(mock.patch.object(bridge.SOCIAL_LITE, 'forget_recent'))
         self.archive = self.stack.enter_context(mock.patch.object(bridge.SOCIAL_ARCHIVE, 'append'))
         for owner, name, value in (
-            (bridge.SOCIAL_MEMORY, 'observe', None),
-            (bridge.SOCIAL_MEMORY, 'context', ''),
-            (bridge.SLANG_LEARNER, 'observe', None),
-            (bridge.SLANG_LEARNER, 'command', None),
-            (bridge.SLANG_LEARNER, 'context', ''),
             (bridge.FEEDBACK_STORE, 'command', None),
             (bridge.FEEDBACK_STORE, 'strategy_hint', ''),
             (bridge.STICKER_CATALOG, 'command', None),
@@ -72,7 +73,7 @@ class FusionCase(unittest.TestCase):
         for name, value in {
             'OWNERS': set(), 'ADMINS': set(), 'SANAE_MENTION_ONLY': True,
             'RELAY_G2S_ENABLED': False, '_is_duplicate': mock.Mock(return_value=False),
-            '_fun_mute_reason': mock.Mock(return_value=None),
+            '_fun_mute_observe': mock.Mock(return_value=None),
             '_pending_natural_operation_reply': mock.Mock(return_value=None),
             '_natural_server_operation_candidate': mock.Mock(return_value=False),
             '_selection_reply': mock.Mock(return_value=None),
@@ -156,16 +157,18 @@ class BridgeFusionTests(FusionCase):
                  'group_id': bridge.SOCIAL_LITE_GROUP, 'user_id': '2001', 'message_id': '501'}
         self.handler._process_event(event)
         self.store.retract.assert_called_once_with(event['group_id'], '501')
-        self.history_clear.assert_called_once_with(event['group_id'], '2001')
-        self.recent_clear.assert_called_once_with(event['group_id'], user_id=event.get('user_id'), clear_closing=event.get('post_type') != 'notice')
+        # Continuity over privacy: no history or group-excerpt wipe on recall.
+        self.history_clear.assert_not_called()
+        self.recent_clear.assert_not_called()
         self.store.observe.assert_not_called()
         self.send.assert_not_called()
 
-    def test_recall_without_sender_clears_group_cache(self):
+    def test_recall_without_sender_keeps_group_cache(self):
         event = {'post_type': 'notice', 'notice_type': 'group_recall',
                  'group_id': bridge.SOCIAL_LITE_GROUP, 'message_id': '501'}
         self.handler._process_event(event)
-        self.history_clear.assert_called_once_with(event['group_id'], None)
+        self.history_clear.assert_not_called()
+        self.recent_clear.assert_not_called()
 
     def test_other_group_recall_cannot_invalidate_current_group_memory(self):
         self.handler._process_event({'post_type': 'notice', 'notice_type': 'group_recall',

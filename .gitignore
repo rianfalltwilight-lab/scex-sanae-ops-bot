@@ -13,6 +13,11 @@ backups/
 downloads/
 tmp/
 resources/**/lang/*.json
+resources/
+maintenance/*.json
+maintenance/*.jsonl
+weekly-report-config.json
+.config-audit/
 *.log
 *.pid
 *.bak*

@@ -25,12 +25,44 @@ def safe_group_name(name: str, group_id: object) -> str:
     return value[:80] or f"group-{group_id}"
 
 
-class ChatArchive:
-    """Append-only archive: ``root/<group-name>/YYYY-MM-DD.log``."""
+_DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.log$")
 
-    def __init__(self, root: str | Path):
+
+def prune_day_files(root: Path, retention_days: int, today) -> int:
+    """Delete ``YYYY-MM-DD.log`` files older than the window, in root and its
+    direct subdirectories.  The date comes from the file name, not mtime."""
+    cutoff = today - timedelta(days=int(retention_days))
+    removed = 0
+    if not root.is_dir():
+        return 0
+    for directory in [root, *(p for p in root.iterdir() if p.is_dir())]:
+        for path in directory.glob("????-??-??.log"):
+            match = _DAY_FILE.match(path.name)
+            try:
+                day = datetime.strptime(match.group(1), "%Y-%m-%d").date() if match else None
+            except ValueError:
+                day = None
+            if day is not None and day < cutoff:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+class ChatArchive:
+    """Append-only archive: ``root/<group-name>/YYYY-MM-DD.log``.
+
+    With ``retention_days`` set, day files older than that window are pruned
+    once per archive day (across every group directory, including renamed ones).
+    """
+
+    def __init__(self, root: str | Path, retention_days: int | None = None):
         self.root = Path(root)
+        self.retention_days = int(retention_days) if retention_days else None
         self._lock = threading.RLock()
+        self._pruned_day = None
 
     def append(self, group_id: object, group_name: str, sender: str,
                text: str, when: datetime | None = None) -> Path | None:
@@ -45,6 +77,9 @@ class ChatArchive:
             directory.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line)
+            if self.retention_days and self._pruned_day != when.date():
+                self._pruned_day = when.date()
+                prune_day_files(self.root, self.retention_days, when.date())
         return path
 
     def read(self, group_id: object, group_name: str, date: str,

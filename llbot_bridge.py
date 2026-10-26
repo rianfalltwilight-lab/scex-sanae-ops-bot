@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 早苗群消息桥接服务（2026-08-16 完全重做版）
-- 监听 SANAE_BRIDGE_PORT，接收早苗 LLBot 的 OneBot 11 HTTP 上报
-- 只处理 LLBOT_GROUP 指定的群；不依赖 OpenClaw agent/hooks
+- 监听 18790，接收早苗 LLBot 的 OneBot 11 HTTP 上报
+- 处理配置中的多个 QQ 群；完全不走 OpenClaw agent/hooks（布鲁斯链路已废弃封存）
 - 全部回复统一走早苗 API（3002）发回
 - 功能路由（全部独立模块，零 agent 依赖）：
   1. !wiki/!百科     → mcmod.cn 抓取（_fetch_wiki）
@@ -25,6 +25,41 @@ import sys as _early_sys
 _STDIO_HANDLES = []
 
 
+class _TimestampedStream:
+    """Prefix each log line with local time so incidents can be placed.
+
+    One lock keeps a single write whole.  print() writes text and newline
+    separately, so concurrent prints may still interleave as they did before.
+    """
+
+    def __init__(self, handle):
+        import threading as _threading
+        from datetime import datetime as _datetime
+        self._handle, self._lock, self._datetime = handle, _threading.Lock(), _datetime
+        self._at_line_start = True
+
+    def write(self, text):
+        if not text:
+            return 0
+        with self._lock:
+            pieces = []
+            for piece in str(text).splitlines(keepends=True):
+                if self._at_line_start:
+                    # Host-local time with its offset: the host runs UTC+9
+                    # while group-facing archives use UTC+8.
+                    pieces.append(self._datetime.now().astimezone().strftime('[%Y-%m-%d %H:%M:%S%z] '))
+                pieces.append(piece)
+                self._at_line_start = piece.endswith(('\n', '\r'))
+            self._handle.write(''.join(pieces))
+        return len(text)
+
+    def flush(self):
+        self._handle.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
 def _configure_child_stdio():
     for stream_name, env_name in (('stdout', 'SANAE_STDOUT_LOG'),
                                   ('stderr', 'SANAE_STDERR_LOG')):
@@ -38,7 +73,7 @@ def _configure_child_stdio():
             handle = open(path, 'a', encoding='utf-8', buffering=1,
                           errors='replace')
             _STDIO_HANDLES.append(handle)
-            setattr(_early_sys, stream_name, handle)
+            setattr(_early_sys, stream_name, _TimestampedStream(handle))
         except Exception:
             # Keep the inherited stream if a diagnostic log cannot be opened;
             # startup and message handling must remain available.
@@ -57,7 +92,6 @@ import collections
 import contextvars
 from contextlib import contextmanager
 import unicodedata
-import difflib
 import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
@@ -82,6 +116,10 @@ from nast_ops_sync import sync_if_stale
 # 模组查询模块（CF 站 + M 站 + 自动翻译）
 from local_secrets import require_secret as _require_secret
 import mod_lookup as _mod_lookup
+from public_errors import public_failure_label
+from runtime_paths import default_path as _default_path
+import fun_mute as _fun
+import bug_reports as _bugs
 _mod_lookup.set_zhipu_key(_require_secret('zhipu_api_key'))
 _mod_lookup.set_cf_api_key(_require_secret('curseforge_api_key'))
 
@@ -91,11 +129,9 @@ from model_display import strip_reply_period
 import backup_watch as _backup_watch
 import shop_query as _shop_query
 from social_lite import SocialLite, OneBotActions, split_social_reply, split_informative_reply
-from slang_learner import SlangLearner
 from social_feedback import FeedbackStore
 from sticker_catalog import StickerCatalog
 from chat_archive import ChatArchive
-from social_memory import SocialMemory
 from conversation_memory import ConversationMemory
 from conversation_turns import ConversationTurns
 from expression_memory import ExpressionMemory
@@ -105,6 +141,8 @@ from functools import wraps
 
 # RCON 反控命令模块（2026-08-16 按腐竹运维监控工具包 QQConsoleBridge 命令集实现）
 import rcon_ops as _rcon_ops
+import command_catalog as _command_catalog
+import server_insight as _server_insight
 from player_bindings import PlayerBindings
 from media_segments import media_segments, media_urls
 from media_ai import image_host_upload, _download, analyze_media as _analyze_media, media_fingerprints
@@ -125,7 +163,7 @@ def _group_ids(raw, fallback):
     return frozenset(values or {int(fallback)})
 
 
-# The configured primary group remains the default. Additional groups share the
+# The original group remains the default.  Additional groups can share the
 # same Sanae bridge without another QQ login or OneBot instance.
 LLBOT_GROUPS = _group_ids(_os.environ.get('SANAE_GROUPS', str(LLBOT_GROUP)), LLBOT_GROUP)
 DISABLED_GROUPS = _group_ids(_os.environ.get('SANAE_DISABLED_GROUPS', ''), 0)
@@ -166,7 +204,7 @@ def _single_server_fallback_allowed(group_id):
 
 
 WIKI_BOT_QQ = SANAE_QQ  # 当前早苗账号；历史机器人账号仍排除自回复和学习
-# 仅限制群聊向游戏转发；按 QQ 账号匹配，昵称变更不影响。幽幽子。
+# 仅限制群聊向游戏转发；按 QQ 账号匹配，昵称变更不影响。
 G2S_EXCLUDED_QQ = frozenset(x.strip() for x in _os.environ.get('SANAE_G2S_EXCLUDED_QQ', '').split(',') if x.strip())
 WIKI_API = _os.environ.get("LLBOT_API", "http://127.0.0.1:3000")
 BRIDGE_PORT = int(_os.environ.get('SANAE_BRIDGE_PORT', '18790'))
@@ -180,7 +218,6 @@ CALLBACK_SOURCE_IPS = {
 # no agent, model call, extra process or token usage.
 FUN_MUTE_GROUP = int(_os.environ.get('FUN_MUTE_GROUP', str(LLBOT_GROUP)))
 FUN_MUTE_USER = str(_os.environ.get('FUN_MUTE_USER', '*')).strip()
-FUN_MUTE_SECONDS = max(60, min(3600, int(_os.environ.get('FUN_MUTE_SECONDS', '300'))))
 
 # 群聊功能总开关（环境变量 GROUP_CHAT_ENABLED=0 关闭；保留私聊转发）
 GROUP_CHAT_ENABLED = _os.environ.get('GROUP_CHAT_ENABLED', '1') == '1'
@@ -198,47 +235,43 @@ SANAE_MENTION_ONLY = _os.environ.get('SANAE_MENTION_ONLY', '1') == '1'
 # Explicit name calls may be enabled without enabling ambient conversation.
 SANAE_NAME_CALL_ENABLED = _os.environ.get('SANAE_NAME_CALL_ENABLED', '0') == '1'
 SOCIAL_LITE = SocialLite(
-    _os.environ.get('SOCIAL_LITE_STATE', _os.path.join(_BRIDGE_DIR, 'state', 'social-lite.json')),
-    _os.environ.get('SOCIAL_LITE_ACTIVITY', _os.path.join(_BRIDGE_DIR, 'logs', 'social-activity.log')),
+    _os.environ.get('SOCIAL_LITE_STATE', _default_path('state', 'social-lite.json')),
+    _os.environ.get('SOCIAL_LITE_ACTIVITY', _default_path('logs', 'social-activity.log')),
     self_id=WIKI_BOT_QQ,
     max_recent=int(_os.environ.get('SOCIAL_LITE_MAX_RECENT', '30')),
     cooldown_seconds=float(_os.environ.get('SOCIAL_LITE_COOLDOWN', '12')),
     spontaneous_probability=float(_os.environ.get('SOCIAL_LITE_SPONTANEOUS', '0')),
     ambient_reply_weight=float(_os.environ.get('SOCIAL_LITE_AMBIENT_WEIGHT', '1.0')),
+    reply_archive_dir=_os.environ.get('SOCIAL_REPLY_ARCHIVE') or None,
+    reply_archive_days=int(_os.environ.get('SOCIAL_REPLY_ARCHIVE_DAYS', '365')),
 )
 QQ_ACTIONS = OneBotActions(_os.environ.get('LLBOT_API', WIKI_API),
                            token=_os.environ.get('LLBOT_API_TOKEN', ''))
-SLANG_LEARNER = SlangLearner(
-    _os.environ.get('SLANG_PATH', _os.path.join(_BRIDGE_DIR, 'state', 'slang.json')),
-    group_id=SOCIAL_LITE_GROUP,
-    max_entries=int(_os.environ.get('SLANG_MAX_ENTRIES', '300')),
-    max_evidence=int(_os.environ.get('SLANG_MAX_EVIDENCE', '8')),
-)
 FEEDBACK_STORE = FeedbackStore(
-    _os.environ.get('FEEDBACK_PATH', _os.path.join(_BRIDGE_DIR, 'state', 'social-feedback.json')),
+    _os.environ.get('FEEDBACK_PATH', _default_path('state', 'social-feedback.json')),
     group_id=SOCIAL_LITE_GROUP,
     max_items=int(_os.environ.get('FEEDBACK_MAX_ITEMS', '500')),
 )
 STICKER_CATALOG = StickerCatalog(
     _os.environ.get('STICKER_MANIFEST', _os.path.join(_BRIDGE_DIR, 'state', 'stickers', 'stickers.json')))
 SOCIAL_ARCHIVE = ChatArchive(_os.environ.get(
-    'SOCIAL_ARCHIVE_ROOT', _os.path.join(_BRIDGE_DIR, 'logs', 'chat-archive')))
-SOCIAL_MEMORY = SocialMemory(_os.environ.get(
-    'SOCIAL_MEMORY_PATH', _os.path.join(_BRIDGE_DIR, 'state', 'social-memory.json')),
-    group_id=SOCIAL_LITE_GROUP,
-    max_topics=int(_os.environ.get('SOCIAL_MEMORY_MAX_TOPICS', '240')))
+    'SOCIAL_ARCHIVE_ROOT', _default_path('logs', 'chat-archive')),
+    retention_days=int(_os.environ.get('SOCIAL_ARCHIVE_DAYS', '365')))
 CONVERSATION_MEMORY = ConversationMemory(
-    _os.environ.get('CONVERSATION_MEMORY_PATH', _os.path.join(_BRIDGE_DIR, 'state', 'conversation-memory.json')),
+    _os.environ.get('CONVERSATION_MEMORY_PATH', _default_path('state', 'conversation-memory.json')),
     allowed_group_ids=(SOCIAL_LITE_GROUP,), bot_user_ids=HISTORICAL_BOT_QQ)
 
 
 CONVERSATION_TURNS = ConversationTurns(allowed_group_ids=(SOCIAL_LITE_GROUP,),
     ttl_seconds=_sanae_ai.limits.LONG_REQUEST_SECONDS + 10)
 EXPRESSION_MEMORY = ExpressionMemory(
-    _os.environ.get('EXPRESSION_MEMORY_PATH', _os.path.join(_BRIDGE_DIR, 'state', 'expression-memory.json')),
+    _os.environ.get('EXPRESSION_MEMORY_PATH', _default_path('state', 'expression-memory.json')),
     allowed_group_ids=(SOCIAL_LITE_GROUP,), bot_user_ids=HISTORICAL_BOT_QQ)
+# Learned expressions drifted toward one technique (understatement); production
+# turns learning off. Stored entries stay on disk but are neither extended nor injected.
+EXPRESSION_LEARNING_ENABLED = _os.environ.get('SANAE_EXPRESSION_LEARNING', '1') == '1'
 REPLY_LESSONS = ReplyLessons(
-    _os.environ.get('REPLY_LESSONS_PATH', _os.path.join(_BRIDGE_DIR, 'state', 'reply-lessons.json')),
+    _os.environ.get('REPLY_LESSONS_PATH', _default_path('state', 'reply-lessons.json')),
     allowed_group_ids=(SOCIAL_LITE_GROUP,), bot_user_ids=HISTORICAL_BOT_QQ)
 SILENT_VISION_ENABLED = _os.environ.get('SANAE_SILENT_VISION', '0') == '1'
 SILENT_VISION = SilentVision(
@@ -273,7 +306,18 @@ def _reply_current(event):
     return turn is None or turn.current()
 
 
+def _social_outcome(event, result, started, metadata):
+    """One line per scheduled social turn, so silence and failure differ in the log."""
+    metadata = metadata or {}
+    print(f"[social-lite] outcome group={event.get('group_id')} user={event.get('user_id')} "
+          f"result={result} elapsed={time.monotonic() - started:.1f}s "
+          f"fallback={int(bool(metadata.get('text_fallback')))} "
+          f"failure={metadata.get('failure') or '-'}", flush=True)
+
+
 def _expression_context(gid, uid, raw):
+    if not EXPRESSION_LEARNING_ENABLED:
+        return ''
     try:
         context, ticket = EXPRESSION_MEMORY.reserve(gid, uid, raw)
         REPLY_EXPRESSION.set(ticket)
@@ -422,17 +466,363 @@ def _auto_sticker(group_id, request, body, *, enabled=True):
                 key, ticket['mood'], ticket['id'], bool(ticket['delivered'])), flush=True)
 
 
-def _fun_mute_thread(event, reason):
-    gid = int(event.get('group_id') or 0)
-    uid = str(event.get('user_id') or '')
+_FUN_ROLE_CACHE = {}
+_FUN_ROLE_TTL = 600
+
+
+def _fun_member_role(gid, uid):
+    """Group role via OneBot ('owner'/'admin'/'member'); '' if unknown."""
     try:
-        QQ_ACTIONS.mute(gid, uid, FUN_MUTE_SECONDS)
-        send_group_msg('片没有，五分钟冷静套餐有。', api=WIKI_API)
-        print(f'[fun-mute] group={gid} user={uid} duration={FUN_MUTE_SECONDS} '
-              f'reason={reason} ok=True', flush=True)
+        return str((QQ_ACTIONS.member_info(gid, uid) or {}).get('role') or '')
     except Exception as exc:
-        print(f'[fun-mute] group={gid} user={uid} duration={FUN_MUTE_SECONDS} '
-              f'reason={reason} ok=False error={type(exc).__name__}', flush=True)
+        print(f'[fun-mute] role lookup failed: {type(exc).__name__}', flush=True)
+        return ''
+
+
+def _fun_bot_can_mute(gid):
+    """Cached: only a group owner/admin account can ban members."""
+    cached = _FUN_ROLE_CACHE.get(gid)
+    now = time.time()
+    if not cached or now - cached[1] > _FUN_ROLE_TTL:
+        cached = (_fun_member_role(gid, WIKI_BOT_QQ), now)
+        _FUN_ROLE_CACHE[gid] = cached
+    return cached[0] in {'owner', 'admin'}
+
+
+# Private messages to the bot were forwarded to every owner; one owner is not a
+# friend of the bot, so half of those sends always failed. Off in production.
+PRIVATE_FORWARD_ENABLED = _os.environ.get('SANAE_PRIVATE_FORWARD', '1') == '1'
+FUN_MUTE_AI_ENABLED = _os.environ.get('FUN_MUTE_AI', '0') == '1'
+FUN_MUTE_COOLDOWN = 900        # at most one joke mute per member per 15 minutes
+FUN_MUTE_HOURLY_CAP = 8        # and at most this many per hour in the group
+_FUN_STATE_LOCK = threading.Lock()
+_FUN_MUTED_UNTIL = {}          # (gid, uid) -> unix time; replies to them pause
+_FUN_LAST_MUTE = {}            # uid -> unix time of the last applied mute
+_FUN_MUTE_TIMES = collections.deque(maxlen=64)
+_FUN_RECENT_NOTICES = collections.deque(maxlen=6)
+_FUN_DORMANT_LOGGED = [0.0]
+FUN_MUTE_STATE_PATH = _os.environ.get('FUN_MUTE_STATE') or _default_path('state', 'fun-mute-state.json')
+_FUN_STATS = {'since': time.time(), 'batches': 0, 'messages': 0, 'dormant': 0, 'decisions': 0,
+              'applied': 0, 'skipped': 0, 'errors': 0}
+
+
+def _fun_load_state(path=None):
+    """Restore cooldowns, the hourly window and recent notices after a restart."""
+    try:
+        with open(path or FUN_MUTE_STATE_PATH, encoding='utf-8') as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return False
+    now = time.time()
+    with _FUN_STATE_LOCK:
+        _FUN_LAST_MUTE.clear()
+        _FUN_LAST_MUTE.update({str(uid): float(stamp) for uid, stamp in (data.get('last_mute') or {}).items()
+                               if now - float(stamp) < FUN_MUTE_COOLDOWN})
+        _FUN_MUTE_TIMES.clear()
+        _FUN_MUTE_TIMES.extend(float(t) for t in data.get('mute_times') or [] if now - float(t) < 3600)
+        _FUN_MUTED_UNTIL.clear()
+        for key, until in (data.get('muted_until') or {}).items():
+            gid, _, uid = str(key).partition(':')
+            if float(until) > now and gid.isdigit():
+                _FUN_MUTED_UNTIL[(int(gid), uid)] = float(until)
+        _FUN_RECENT_NOTICES.clear()
+        _FUN_RECENT_NOTICES.extend(str(x) for x in (data.get('recent_notices') or [])[-6:])
+    return True
+
+
+def _fun_save_state(path=None):
+    path = path or FUN_MUTE_STATE_PATH
+    with _FUN_STATE_LOCK:
+        data = {'last_mute': dict(_FUN_LAST_MUTE), 'mute_times': list(_FUN_MUTE_TIMES),
+                'muted_until': {f'{gid}:{uid}': until for (gid, uid), until in _FUN_MUTED_UNTIL.items()},
+                'recent_notices': list(_FUN_RECENT_NOTICES)}
+    try:
+        _os.makedirs(_os.path.dirname(_os.path.abspath(path)), exist_ok=True)
+        temp = path + '.tmp'
+        with open(temp, 'w', encoding='utf-8') as stream:
+            json.dump(data, stream, ensure_ascii=False)
+        _os.replace(temp, path)
+    except OSError as exc:
+        print(f'[fun-mute] state save failed: {type(exc).__name__}', flush=True)
+
+
+def _fun_stat(key, amount=1):
+    """Count judge work; one summary line per hour, so call volume stays visible."""
+    with _FUN_STATE_LOCK:
+        _FUN_STATS[key] = _FUN_STATS.get(key, 0) + amount
+        now = time.time()
+        if now - _FUN_STATS['since'] < 3600:
+            return
+        line = ' '.join(f'{name}={_FUN_STATS[name]}' for name in
+                        ('batches', 'messages', 'dormant', 'decisions', 'applied', 'skipped', 'errors'))
+        _FUN_STATS.update(since=now, batches=0, messages=0, dormant=0, decisions=0,
+                          applied=0, skipped=0, errors=0)
+    print('[fun-mute] last hour: ' + line, flush=True)
+
+
+def _fun_recently_muted(gid, uid):
+    with _FUN_STATE_LOCK:
+        return _FUN_MUTED_UNTIL.get((int(gid or 0), str(uid)), 0) > time.time()
+
+
+def _fun_group_muted_lately(gid, window=600):
+    """Any joke mute in this group still running or ended within `window` seconds."""
+    now = time.time()
+    with _FUN_STATE_LOCK:
+        return any(g == int(gid or 0) and until > now - window for (g, _uid), until in _FUN_MUTED_UNTIL.items())
+
+
+# A reply may talk about a real mute; only one with no mute behind it is stopped.
+_sanae_ai.RECENT_MUTE_FN = _fun_group_muted_lately
+
+
+def _fun_judge(context, batch):
+    """Judge thread: skip the model entirely while the bot cannot mute."""
+    if not _fun_bot_can_mute(FUN_MUTE_GROUP):
+        _fun_stat('dormant')
+        now = time.time()
+        if now - _FUN_DORMANT_LOGGED[0] >= 3600:
+            _FUN_DORMANT_LOGGED[0] = now
+            print('[fun-mute] dormant: bot is not a group admin; messages are not judged', flush=True)
+        return []
+    started = time.monotonic()
+    _fun_stat('batches')
+    _fun_stat('messages', len(batch))
+    try:
+        decisions = _sanae_ai.judge_fun_mute(context, batch)
+    except Exception as exc:
+        _fun_stat('errors')
+        print(f'[fun-mute] judge failed: {type(exc).__name__}', flush=True)
+        return []
+    _fun_stat('decisions', len(decisions))
+    if decisions:
+        print(f'[fun-mute] judged n={len(batch)} mutes={len(decisions)} '
+              f'elapsed={time.monotonic() - started:.1f}s', flush=True)
+    return decisions
+
+
+def _fun_apply(item, decision):
+    """Hard limits stay here; the model only proposes scene, duration and words."""
+    gid, uid = FUN_MUTE_GROUP, str(item.get('uid') or '')
+    scene = str(decision.get('scene') or 'other')
+    seconds = _fun.clamp(decision.get('seconds'), scene)
+    label = f'[fun-mute] group={gid} user={uid} scene={scene} duration={seconds}'
+    now = time.time()
+    with _FUN_STATE_LOCK:
+        limited = ('cooldown' if now - _FUN_LAST_MUTE.get(uid, 0) < FUN_MUTE_COOLDOWN else
+                   'hourly-cap' if sum(1 for stamp in _FUN_MUTE_TIMES if now - stamp < 3600) >= FUN_MUTE_HOURLY_CAP
+                   else '')
+        if not limited:
+            # Mark first so a reply already being generated for them is not sent.
+            _FUN_MUTED_UNTIL[(gid, uid)] = now + seconds
+    if limited:
+        _fun_stat('skipped')
+        print(label + ' skipped=' + limited, flush=True)
+        return
+
+    def release():
+        with _FUN_STATE_LOCK:
+            _FUN_MUTED_UNTIL.pop((gid, uid), None)
+
+    if _fun_member_role(gid, uid) in {'owner', 'admin'}:
+        release()
+        _fun_stat('skipped')
+        print(label + ' skipped=target-is-admin', flush=True)
+        return
+    try:
+        with _FUN_STATE_LOCK:
+            recent = list(_FUN_RECENT_NOTICES)
+        notice = _fun.clean_notice(_sanae_ai.write_fun_mute_notice(
+            item.get('text', ''), scene, _fun.duration_text(seconds),
+            decision.get('reason', ''), recent, scope=str(gid)), rejects=_sanae_ai._leaked_tool_markup)
+    except Exception as exc:
+        print(label + f' notice-failed={type(exc).__name__}', flush=True)
+        notice = ''
+    if not notice:
+        release()
+        _fun_stat('skipped')
+        print(label + ' skipped=no-notice', flush=True)
+        return
+    try:
+        QQ_ACTIONS.mute(gid, uid, seconds)
+    except Exception as exc:
+        _FUN_ROLE_CACHE.pop(gid, None)
+        release()
+        _fun_stat('errors')
+        print(label + f' ok=False error={type(exc).__name__} detail={str(exc)[:80]}', flush=True)
+        return
+    with _FUN_STATE_LOCK:
+        _FUN_LAST_MUTE[uid] = now
+        _FUN_MUTE_TIMES.append(now)
+        _FUN_RECENT_NOTICES.append(notice)
+    _fun_stat('applied')
+    _fun_save_state()
+    token = REPLY_GROUP.set(gid)
+    try:
+        send_group_msg(notice, api=WIKI_API)
+    finally:
+        REPLY_GROUP.reset(token)
+    try:
+        # She should know what she just did when someone asks about it.
+        SOCIAL_LITE.record_outgoing(gid, f'（禁言 {_fun.duration_text(seconds)}）{notice}',
+                                    action='mute', reply_to_user_id=uid)
+    except Exception as exc:
+        print(f'[fun-mute] context record failed: {type(exc).__name__}', flush=True)
+    print(label + f' ok=True reason={str(decision.get("reason") or "")[:40]} notice={notice}', flush=True)
+
+
+FUN_MUTE_JUDGE = _fun.FunMuteJudge(_fun_judge, _fun_apply,
+    log=lambda line: print(line, flush=True))
+if FUN_MUTE_AI_ENABLED:
+    _fun_load_state()
+
+
+# ===== 玩家问题反馈（AI 从聊天里识别 + !bug 手动提交）=====
+BUG_REPORT_GROUPS = _group_ids(_os.environ.get('BUG_REPORT_GROUPS', ''), 0) - {0}
+BUG_DIGEST_GROUPS = _group_ids(_os.environ.get('BUG_DIGEST_GROUPS', ''), 0) - {0}
+BUG_DIGEST_HOUR = int(_os.environ.get('BUG_DIGEST_HOUR', '21'))
+BUG_LEDGER = _bugs.BugLedger(
+    _os.environ.get('BUG_REPORTS_PATH') or _default_path('state', 'bug-reports.json'),
+    inventory_path=_os.path.join(str(OPS_STATE_BASE), 'legacy', 'mod-inventory.json'),
+    events_path=_os.path.join(str(OPS_STATE_BASE), 'legacy', 'events.jsonl'))
+_BUG_MESSAGES = collections.OrderedDict()     # message id -> who said what, for evidence
+_BUG_LOCK = threading.Lock()
+_BUG_STATS = collections.Counter()
+_BUG_STATS_SINCE = [time.time()]
+
+
+def _bug_stat(key, amount=1):
+    with _BUG_LOCK:
+        _BUG_STATS[key] += amount
+        if time.time() - _BUG_STATS_SINCE[0] >= 3600:
+            if _BUG_STATS.get('batches'):
+                print('[bug-report] last hour: ' + ' '.join(
+                    f'{k}={_BUG_STATS.get(k, 0)}' for k in ('batches', 'messages', 'new', 'merged', 'errors')),
+                    flush=True)
+            _BUG_STATS.clear()
+            _BUG_STATS_SINCE[0] = time.time()
+
+
+def _bug_judge(gid, context, batch):
+    """Judge thread: write found reports straight into the ledger; nothing per-item to apply."""
+    started = time.monotonic()
+    _bug_stat('batches')
+    _bug_stat('messages', len(batch))
+    try:
+        reports = _sanae_ai.judge_bug_reports(context, batch, BUG_LEDGER.open_items(),
+                                              BUG_LEDGER.installed_ids())
+    except Exception as exc:
+        _bug_stat('errors')
+        print(f'[bug-report] judge failed group={gid}: {type(exc).__name__}', flush=True)
+        return []
+    for report in reports:
+        with _BUG_LOCK:
+            evidence = [dict(_BUG_MESSAGES[mid], message_id=mid) for mid in report['ids'] if mid in _BUG_MESSAGES]
+        try:
+            item, merged = BUG_LEDGER.record(report, evidence, gid)
+        except Exception as exc:
+            _bug_stat('errors')
+            print(f'[bug-report] save failed: {type(exc).__name__}', flush=True)
+            continue
+        _bug_stat('merged' if merged else 'new')
+        print(f'[bug-report] {"merged" if merged else "new"} #{item["id"]} group={gid} '
+              f'mod={item["mod"] or "-"} category={item["category"]} title={item["title"]} '
+              f'elapsed={time.monotonic() - started:.1f}s', flush=True)
+    return []
+
+
+_BUG_JUDGES = {gid: _fun.FunMuteJudge(lambda context, batch, gid=gid: _bug_judge(gid, context, batch),
+                                      lambda item, decision: None, quiet=30.0, max_wait=180.0,
+                                      context_size=15, batch_size=20, max_pending=60,
+                                      log=lambda line: print(line, flush=True), label='bug-report')
+               for gid in BUG_REPORT_GROUPS}
+
+
+def _bug_observe(event, raw):
+    """Every text message is context; non-command messages of 6+ characters get judged."""
+    try:
+        gid = int(event.get('group_id') or 0)
+        judge = _BUG_JUDGES.get(gid)
+        if judge is None:
+            return
+        text = _normalize(raw if isinstance(raw, str) else str(raw or ''))[:300]
+        uid = str(event.get('user_id') or '')
+        if not text or uid == WIKI_BOT_QQ or uid in HISTORICAL_BOT_QQ:
+            return
+        sender = event.get('sender') or {}
+        mid = str(event.get('message_id') or f'{uid}-{time.time():.3f}')
+        name = str(sender.get('card') or sender.get('nickname') or '群友')[:24]
+        stamp = time.strftime('%H:%M:%S')
+        with _BUG_LOCK:
+            _BUG_MESSAGES[mid] = {'uid': uid, 'name': name, 'text': text,
+                                  'time': _bugs._clock(time.time())}
+            while len(_BUG_MESSAGES) > 600:
+                _BUG_MESSAGES.popitem(last=False)
+        judge.observe({'id': mid, 'uid': uid, 'name': name, 'time': stamp, 'text': text,
+                       'sender': __import__('hashlib').sha256(uid.encode('utf-8')).hexdigest()[:6]},
+                      eligible=len(text) >= 6 and not text.startswith(('!', '！', '/')))
+    except Exception as exc:
+        print(f'[bug-report] observe failed: {type(exc).__name__}', flush=True)
+
+
+def _bug_digest_once(now=None):
+    """Send today's digest when due; returns True when one was delivered."""
+    if not BUG_DIGEST_GROUPS:
+        return False
+    text, ids = BUG_LEDGER.digest_due(now, hour=BUG_DIGEST_HOUR)
+    if not text:
+        return False
+    ok = True
+    for gid in sorted(BUG_DIGEST_GROUPS):
+        token = REPLY_GROUP.set(gid)
+        try:
+            ok = send_group_msg(text, api=WIKI_API) and ok
+        finally:
+            REPLY_GROUP.reset(token)
+    BUG_LEDGER.mark_digest(ids, ok, now)
+    print(f'[bug-report] digest items={len(ids)} ok={ok}', flush=True)
+    return ok
+
+
+def _bug_digest_loop():
+    while True:
+        try:
+            _bug_digest_once()
+        except Exception as exc:
+            print(f'[bug-report] digest failed: {type(exc).__name__}', flush=True)
+        time.sleep(300)
+
+
+def _forward_summary(read_result):
+    """Compact 'speaker：text / ...' from qq_chat_reader JSON; '' if unreadable."""
+    try:
+        data = json.loads(read_result)
+    except (TypeError, ValueError):
+        return ''
+    if not isinstance(data, dict) or data.get('error'):
+        return ''
+    parts = [_sanae_ai.chat_recall.compact_forward(message.get('text'), limit=4000)
+             for message in data.get('messages') or [] if isinstance(message, dict)]
+    return ' / '.join(part for part in parts if part)
+
+
+def _ingest_forward(event):
+    """Expand a forwarded chat record once, so replies and the archive can read it."""
+    gid, mid = event.get('group_id'), event.get('message_id')
+    try:
+        text = _forward_summary(_sanae_ai.qq_chat_reader.read_qq_message(
+            _sanae_ai.LLBOT_API, int(gid), int(mid)))
+        if not text:
+            print(f'[forward] group={gid} message={mid} unreadable', flush=True)
+            return
+        SOCIAL_LITE.record_forward(event, text)
+        sender = event.get('sender') or {}
+        SOCIAL_ARCHIVE.append(gid, event.get('group_name') or str(gid),
+                              sender.get('card') or sender.get('nickname') or event.get('user_id'),
+                              '[聊天记录] ' + text[:1500])
+        print(f'[forward] group={gid} message={mid} chars={len(text)}', flush=True)
+    except Exception as exc:
+        print(f'[forward] ingest failed: {type(exc).__name__}', flush=True)
 
 
 def _refresh_nast_ops():
@@ -453,8 +843,8 @@ def _nast_ops_sync_loop():
         time.sleep(OPS_NAST_SYNC_INTERVAL)
 PLAYER_BINDINGS_ENABLED = _os.environ.get('PLAYER_BINDINGS_ENABLED', '') == '1'
 PLAYER_BINDINGS = PlayerBindings(_os.environ.get(
-    'PLAYER_BINDINGS_PATH', _os.path.join(_BRIDGE_DIR, 'logs', 'qq-player-binds.json')))
-CHAT_RELAY_STATE = _os.path.join(_BRIDGE_DIR, 'logs', 'qq-chat-relay.json')
+    'PLAYER_BINDINGS_PATH', _default_path('logs', 'qq-player-binds.json')))
+CHAT_RELAY_STATE = _default_path('logs', 'qq-chat-relay.json')
 _CHAT_RELAY_LOCK = threading.Lock()
 
 # ===== 权限配置（私聊转发目标用）=====
@@ -479,87 +869,49 @@ def _normalize(raw):
     return s.strip()
 
 
-_FUN_MUTE_EXAMPLES = (
-    '来点片', '发点片', '整点片', '有没有片', '求片',
-    '来点涩图', '发点色图', '来点本子', '来点人妻',
-    '来点淫秽色情', '来点色情内容', '来点黄色废料', '搞点少儿不宜的',
-    '帮我生成黄文', '帮我写群主黄文', '生成群主黄文',
-    '帮我骚扰群主', '骚扰群主',
-)
-_FUN_REQUEST_WORDS = ('来点', '来张', '发点', '发张', '整点', '给我', '求', '有没有',
-                      '生成', '写', '搞点', '安排')
-_FUN_ADULT_WORDS = ('黄片', '毛片', '涩图', '色图', '黄图', '黄文', '本子', '人妻',
-                    '成人图', '成人视频', '色情', '淫秽', '淫乱', '少儿不宜',
-                    '成人内容', '黄色废料', '黄色内容', '成人向', '限制级',
-                    'porn', 'hentai', 'nsfw')
-_FUN_HARASS_WORDS = ('骚扰', '轰炸', '调戏', '非礼')
-_FUN_BENIGN_CONTEXT = ('不要', '别发', '禁止', '有人说', '他说', '关键词', '正则',
-                       '功能', '测试', '讨论', '为什么')
-_FUN_BENIGN_PIAN_WORDS = ('碎片', '芯片', '照片', '图片', '纪录片', '动画片',
-                          '影片', '唱片', '切片')
+def _fun_mentions_someone_else(event):
+    """An @ of another member makes "禁言我"-style text ambiguous; skip it."""
+    raw = str(event.get('raw_message') or '')
+    targets = set(re.findall(r'\[CQ:at,qq=(\d+|all)', raw))
+    for seg in event.get('message') or []:
+        if isinstance(seg, dict) and seg.get('type') == 'at':
+            targets.add(str((seg.get('data') or {}).get('qq') or ''))
+    return bool(targets - {WIKI_BOT_QQ, ''})
 
 
-def _fun_compact_text(raw):
-    """Return normalized text for the zero-token local moderation classifier."""
-    text = html.unescape(_normalize(str(raw or ''))).lower()
-    text = text.replace('澀', '色').replace('涩', '色').replace('瑟图', '色图')
-    return re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', text)
-
-
-def _fun_mute_intent(raw):
-    """Classify the configured joke behaviour without an LLM.
-
-    Returns a short local reason for high-confidence matches, otherwise ''.
-    It combines intent-feature scoring with fuzzy similarity, so this is not
-    an exact regular-expression trigger and costs zero model tokens.
-    """
-    text = _fun_compact_text(raw)
-    if not text or len(text) > 48:
-        return ''
-    compact_examples = tuple(_fun_compact_text(item) for item in _FUN_MUTE_EXAMPLES)
-    if text in compact_examples:
-        return 'exact-example'
-    if any(marker in text for marker in _FUN_BENIGN_CONTEXT):
-        return ''
-    if any(marker in text for marker in _FUN_BENIGN_PIAN_WORDS):
-        return ''
-
-    # Short misspellings and small wording variants of curated examples.
-    similarity = max(difflib.SequenceMatcher(None, text, item).ratio()
-                     for item in compact_examples)
-    if len(text) <= 18 and similarity >= 0.84:
-        return 'fuzzy-example'
-
-    score = 0
-    request = any(word in text for word in _FUN_REQUEST_WORDS)
-    adult = any(word in text for word in _FUN_ADULT_WORDS)
-    harassment = any(word in text for word in _FUN_HARASS_WORDS)
-    named_target = any(word in text for word in ('群主', '管理', '她', '他')) or bool(re.search(BOT_NAME_PATTERN, text, re.I))
-    if request:
-        score += 2
-    if adult:
-        score += 3
-    if harassment:
-        score += 3
-    if harassment and named_target:
-        score += 2
-    if ('生成' in text or '写' in text) and ('黄文' in text or '黄图' in text):
-        score += 2
-    if any(phrase in text for phrase in ('来点片', '发点片', '整点片', '有没有片', '求片',
-                                         '好久没发片', '发片了')):
-        score += 5
-    return 'intent-score' if score >= 5 else ''
-
-
-def _fun_mute_reason(event):
+def _fun_mute_eligible(event, uid):
+    """Ordinary members of the configured group only; the model never sees this list."""
     if int(event.get('group_id') or 0) != FUN_MUTE_GROUP:
-        return ''
-    uid = str(event.get('user_id') or '')
-    if not uid or uid == WIKI_BOT_QQ or uid in OWNERS or uid in ADMINS:
-        return ''
-    if FUN_MUTE_USER not in ('', '*', 'all') and uid != FUN_MUTE_USER:
-        return ''
-    return _fun_mute_intent(event.get('raw_message') or event.get('message') or '')
+        return False
+    if not uid or uid == WIKI_BOT_QQ or uid in HISTORICAL_BOT_QQ or uid in OWNERS or uid in ADMINS:
+        return False
+    return FUN_MUTE_USER in ('', '*', 'all') or uid == FUN_MUTE_USER
+
+
+def _fun_mute_observe(event, raw, addressed):
+    """Queue one text message for the AI judge; never blocks or raises."""
+    if not FUN_MUTE_AI_ENABLED:
+        return
+    try:
+        if int(event.get('group_id') or 0) != FUN_MUTE_GROUP:
+            return
+        text = _normalize(raw if isinstance(raw, str) else str(raw or ''))[:300]
+        if not text or text.startswith(('!', '！', '/')):
+            return
+        uid = str(event.get('user_id') or '')
+        sender = event.get('sender') or {}
+        FUN_MUTE_JUDGE.observe({
+            'id': str(event.get('message_id') or f'{uid}-{time.time():.3f}'),
+            'uid': uid,
+            # The model tells people apart by this key; names may collide.
+            'sender': __import__('hashlib').sha256(uid.encode('utf-8')).hexdigest()[:6],
+            'name': str(sender.get('card') or sender.get('nickname') or '群友')[:24],
+            'time': time.strftime('%H:%M:%S'), 'text': text,
+            'addressed_bot': bool(addressed),
+            'mentions_others': _fun_mentions_someone_else(event),
+        }, eligible=_fun_mute_eligible(event, uid))
+    except Exception as exc:
+        print(f'[fun-mute] observe failed: {type(exc).__name__}', flush=True)
 
 
 def _selection_reply(raw, group_id, user_id):
@@ -649,6 +1001,70 @@ def _server_query_backend(server):
         return query_server(server, command)
     routed.server_id = server['id']
     return routed
+
+
+# Roots whose arguments are free text, so Chinese there still means an exact command.
+_CONSOLE_TEXT_ROOTS = {'say', 'tellraw', 'msg', 'tell', 'w', 'me', 'teammsg', 'tm', 'title',
+                       'kick', 'ban', 'ban-ip', 'bossbar', 'team', 'scoreboard', 'trigger'}
+_CONSOLE_CJK = re.compile(r'[\u3400-\u9fff\uff00-\uffef]')
+
+
+def _console_plan(target, rest):
+    """Route one admin `!cmd`: (kind, command, detail).
+
+    usage   - empty or malformed; the old handler prints the usage line.
+    legacy  - no scanned catalog for this server; the old confirmation path.
+    direct  - a registered read/low command; runs at once (detail = risk class).
+    confirm - a registered command that needs a code (detail = registered usage).
+    ai      - free text, an unknown root, or Chinese where an ID belongs; she works it out.
+    """
+    text = str(rest or '').strip()
+    if text.startswith('<') and text.endswith('>'):
+        text = text[1:-1].strip()
+    try:
+        command = _command_catalog.normalize_console_command(text)
+    except ValueError:
+        return 'usage', '', ''
+    if not _command_catalog.summary(target['id'])['count']:
+        return 'legacy', command, ''
+    supported, usage, _reason = _command_catalog.validate(target['id'], command)
+    root = command.split(None, 1)[0].lstrip('/').casefold()
+    if not supported or (_CONSOLE_CJK.search(command) and root not in _CONSOLE_TEXT_ROOTS):
+        return 'ai', text, ''
+    risk = _command_catalog.classify(command)
+    if risk in ('read', 'low'):
+        return 'direct', command, risk
+    return 'confirm', command, usage
+
+
+_SOCIAL_SERVER_RE = re.compile(
+    r'服务器|服务端|开服|炸服|崩服|崩了|掉线|进不去|连不上|在线|几个人|多少人|人多|有人在玩|有人上|'
+    r'卡不卡|好卡|很卡|太卡|有点卡|卡死|卡顿|卡爆|延迟|TPS|MSPT', re.I)
+
+
+def _social_server_status(gid, raw):
+    """'〖服务器现状〗[怀旧] 在线 6/20，TPS 19.5…' when the message is about the server."""
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw or ''))
+    if not _SOCIAL_SERVER_RE.search(text):
+        return ''
+    try:
+        server, _error = get_group_default(gid)
+        if not server:
+            enabled = list_servers()
+            server = enabled[0] if len(enabled) == 1 else None
+        if not server:
+            return ''
+        ops_root = _os.path.join(str(OPS_STATE_BASE), str(server['id']))
+        status = _server_insight.live_status(ops_root)
+        verdict = _server_insight.live_verdict(ops_root)
+    except Exception as exc:
+        print(f'[social-lite] server status skipped: {type(exc).__name__}', flush=True)
+        return ''
+    if not status:
+        return ''
+    # TPS 20 with MSPT in the 40s reads as "busy" to a model; state the verdict.
+    return (f'〖服务器现状〗{server_prefix(server)} {status}'
+            + (f'；按 TPS/MSPT 判断：{verdict}（TPS≥18 且 MSPT<50 算流畅）' if verdict else ''))
 
 # ===== RCON 只读查询路由（!tps/!list/status，任何权限可查，秒回零 token）=====
 _QUERY_PATTERNS = [
@@ -1008,13 +1424,20 @@ def _explicit_media_question(raw):
     return _explicit_media_command(raw) or bool(re.match(r'^[!！]\s*问(?:\s|$)', text))
 
 
-def _media_reply_thread(event, raw, uid, gid, privileged):
+def _media_reply_thread(event, raw, uid, gid, privileged, text_reply=None):
     started_at = time.monotonic()
     budget = Budget(_sanae_ai.limits.LONG_REQUEST_SECONDS)
     preprocess_budget = Budget(120, deadline=budget.deadline, parent=budget)
     try:
         result = bounded_call(lambda: _analyze_media(event, WIKI_API, raw, preprocess_budget),
                               budget=preprocess_budget, seconds=120)
+        if result['status'] == 'no media' and not _explicit_media_command(raw) and text_reply is not None:
+            # Only a quoted or forwarded text: answer like any other @ message. The bare call
+            # below had no server, nickname, chat context or short-reply mode, so on 10-26 she
+            # said the market "could not be reached" (its tool refused without a server),
+            # lectured "我也要" as a 涩图 request and called herself "群里的 AI 角色".
+            text_reply(event, True)
+            return
         if result['status'] == 'no media' and not _explicit_media_command(raw):
             answer = _sanae_ai.sanae_reply(raw, uid, privileged=privileged, group_id=gid,
                 force=True, request_budget=budget, request_started_at=started_at)
@@ -1472,7 +1895,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 SILENT_VISION.retract(event.get('group_id'), event.get('message_id'))
                 CONVERSATION_TURNS.retract(event.get('group_id'), event.get('message_id'))
                 FEEDBACK_STORE.retract(event.get('message_id'), group_id=event.get('group_id'))
-                _forget_conversation_context(event.get('group_id'), event.get('user_id'), clear_closing=False)
+                # Continuity over privacy (owner decision 2026-10-25): a recall no
+                # longer wipes the group's recent excerpts or the sender's chat
+                # history; only records sourced from this message go.  !忘记 still clears.
             except Exception as exc:
                 print(f'[conversation-memory] recall failed: {type(exc).__name__}', flush=True)
             return
@@ -1482,10 +1907,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             _start_worker(_shop_query.reply, args=(event,))
             return
 
-        # 私聊消息：转发给狗蛋
+        # 私聊消息：转发给狗蛋（生产环境已关闭，SANAE_PRIVATE_FORWARD=0）
         if event.get('post_type') == 'message' and event.get('message_type') == 'private':
             uid = str(event.get('user_id', ''))
-            if uid != str(event.get('self_id', '')) and uid not in HISTORICAL_BOT_QQ:
+            if (PRIVATE_FORWARD_ENABLED and uid != str(event.get('self_id', ''))
+                    and uid not in HISTORICAL_BOT_QQ):
                 _start_worker(self._forward_private, args=(event,))
             return
 
@@ -1516,7 +1942,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 natural_operation_candidate = _natural_server_operation_candidate(
                     raw, privileged,
                     direct_name_candidate and not SANAE_MENTION_ONLY, at_candidate)
-                fun_mute_reason = _fun_mute_reason(event)
+                # The AI judge sees every text message, duplicates included,
+                # before any routing below can return early.
+                _fun_mute_observe(event, raw, at_candidate or direct_name_candidate)
+                _bug_observe(event, raw)
                 # Passive images have their own bounded worker. They neither
                 # wake a reply nor enter the archive or long-term memory.
                 # Explicit image questions retain their existing vision route.
@@ -1536,15 +1965,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
                 if (_is_duplicate(raw, uid) and
                         not (direct_name_candidate or at_candidate or
-                             pending_operation_candidate or natural_operation_candidate or
-                             fun_mute_reason)):
+                             pending_operation_candidate or natural_operation_candidate)):
                     return
 
                 # Host network diagnostics run independently of server selection and AI.
                 if _network_commands.handle(raw, lambda text: send_group_msg(text, api=WIKI_API)):
                     return
 
-                # TPS/在线查询必须独立于 AI、黑话、记忆和贴纸状态。
+                # TPS/在线查询必须独立于 AI、记忆和贴纸状态。
                 # 即使社交持久化故障，也应能直接走只读 RCON 并回群。
                 qk = _match_query(raw)
                 if qk:
@@ -1605,7 +2033,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         print(f'[conversation-memory] observe failed: {type(exc).__name__}', flush=True)
 
-                if not _is_ai_operation_turn(raw, privileged):
+                if EXPRESSION_LEARNING_ENABLED and not _is_ai_operation_turn(raw, privileged):
                     try:
                         if EXPRESSION_MEMORY.observe(event):
                             expression_batch = EXPRESSION_MEMORY.prepare_batch(gid)
@@ -1615,8 +2043,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         print(f'[expression-memory] observe failed: {type(exc).__name__}', flush=True)
 
-                # Long-term archive stores sanitized group activity; aggregate
-                # memory stores topics only and never raw text.
+                # Long-term archive stores sanitized group activity.
                 sender = event.get('sender') or {}
                 nick = sender.get('card') or sender.get('nickname') or uid
                 archive_text = _normalize(raw)
@@ -1624,28 +2051,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     archive_text = '[管理员 QQ 动作]'
                 try:
                     SOCIAL_ARCHIVE.append(gid, event.get('group_name') or str(gid), nick, archive_text)
-                    SOCIAL_MEMORY.observe(event)
                 except Exception as exc:
-                    print(f'[social-memory] archive failed: {type(exc).__name__}', flush=True)
-
-                # Local zero-token easter egg moderation for one configured
-                # member in one configured group.  Consume the message here so
-                # it cannot also wake the model or trigger stickers.
-                if fun_mute_reason:
-                    _start_worker(_fun_mute_thread, args=(event, fun_mute_reason))
-                    return
-
-                # 只记录本群语料；黑话必须由管理员显式确认后才会注入 AI。
-                # 语料状态是可选持久化，写入失败不能阻断正常收消息/回复。
-                try:
-                    SLANG_LEARNER.observe(event)
-                    slang_reply = SLANG_LEARNER.command(raw, privileged)
-                except Exception as exc:
-                    print(f'[slang] state write/read failed: {type(exc).__name__}', flush=True)
-                    slang_reply = None
-                if slang_reply:
-                    _start_worker(lambda t=slang_reply: send_group_msg(t, api=WIKI_API))
-                    return
+                    print(f'[chat-archive] append failed: {type(exc).__name__}', flush=True)
+                if str(gid) == str(SOCIAL_LITE_GROUP) and media_segments(event, ('forward',)):
+                    # A forwarded chat record shows up as an empty line otherwise.
+                    _start_worker(_ingest_forward, args=(event,))
 
                 feedback_text = re.sub(r'\[CQ:(?:at|reply),[^\]]*\]', '', raw).strip()
                 if str(gid) == str(SOCIAL_LITE_GROUP):
@@ -1681,6 +2091,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if selection_reply:
                     send_group_msg(selection_reply, api=WIKI_API)
                     return
+                if int(gid or 0) in BUG_REPORT_GROUPS and _bugs.COMMAND.match(_normalize(raw)):
+                    sender = event.get('sender') or {}
+                    bug_reply = _bugs.command(BUG_LEDGER, _normalize(raw), uid,
+                                              str(sender.get('card') or sender.get('nickname') or uid)[:24],
+                                              int(gid), privileged, event.get('message_id'))
+                    if bug_reply:
+                        _start_worker(lambda t=bug_reply: send_group_msg(t, api=WIKI_API))
+                        print(f'[bug-report] command user={uid} privileged={privileged}', flush=True)
+                        return
                 if match_ops_command(raw):
                     _start_worker(self._ops_reply_thread, args=(raw, gid, uid, privileged))
                     return
@@ -1714,7 +2133,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
                 media_reason = _media_request_reason(raw, event)
                 if media_reason:
-                    queued = _start_ai_worker(_media_reply_thread, args=(event, raw, uid, gid, privileged))
+                    queued = _start_ai_worker(_media_reply_thread,
+                                              args=(event, raw, uid, gid, privileged, self._sanae_reply_thread))
                     print(f'[sanae-route] channel=media trigger={media_reason} queued={bool(queued)}', flush=True)
                     return
 
@@ -1740,6 +2160,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                      f'也可以在本条命令中加 {server_hint()}。')
                         else:
                             backend = _server_query_backend(target) if target else None
+                            console_plan = None
+                            if (privileged and target
+                                    and _rcon_ops.command_word(cmd_text) in {'cmd', '控制台'}):
+                                parts = cmd_text.split(None, 1)
+                                console_plan = _console_plan(target, parts[1] if len(parts) > 1 else '')
+                            if console_plan and console_plan[0] in {'direct', 'confirm', 'ai'}:
+                                start = _start_worker if console_plan[0] == 'direct' else _start_ai_worker
+                                if start(self._console_command_thread,
+                                         args=(event, console_plan, target, uid, gid)) is False:
+                                    send_group_msg(f'{server_prefix(target)} 现在排队的请求太多，'
+                                                   '稍后再发一次 !cmd。', api=WIKI_API)
+                                print(f"[rcon] 智能控制台: user={uid} kind={console_plan[0]} "
+                                      f"target={target['id']}", flush=True)
+                                return
                             reply = _rcon_ops.dispatch(
                                 cmd_text, uid, uid, privileged,
                                 query_fn=backend, server=target)
@@ -1810,7 +2244,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         _sanae_ai.chat_recall.is_recall(raw)):
                     _queue_sanae_reply(self._sanae_reply_thread, event, True)
                     return
-                # 恢复旧的自动路由：配置的社交群里“早苗……”点名进入社交上下文，
+                # 恢复旧的自动路由：362 群里“早苗……”点名进入社交上下文，
                 # 不强制套用 @用户 的直答格式。真实 @ 仍在上方走 AI 通道。
                 if (direct_name_call and SANAE_NAME_CALL_ENABLED
                         and media_segments(event, ('image',))):
@@ -1830,7 +2264,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     print(f"[sanae] 点名早苗转社交上下文: user={uid} scheduled={scheduled} reason={reason}", flush=True)
                     return
 
-                # 其他启用点名的群保留原有 AI 直答兜底；配置的社交群已由上面的
+                # 其他启用点名的群保留原有 AI 直答兜底；362 群已由上面的
                 # Social Lite 自动路由优先接管。
                 if SANAE_NAME_CALL_ENABLED and direct_name_call:
                     _queue_sanae_reply(self._sanae_reply_thread, event, True)
@@ -1844,7 +2278,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                             chat_only=True, directed=False)):
                     return
 
-                # Social Lite 只在配置的社交群启用；本地门控后再单轮唤醒模型。
+                # Social Lite 只在配置的群启用；本地门控后再单轮唤醒模型。
                 if (not SANAE_MENTION_ONLY and SOCIAL_LITE_ENABLED and
                         gid == SOCIAL_LITE_GROUP):
                     try:
@@ -1896,7 +2330,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             msg = _mod_lookup.lookup_cf(keyword) if source == 'cf' else _mod_lookup.lookup_mod(keyword)
         except Exception as e:
             print(f'[mod] 查询异常: {e}', flush=True)
-            msg = f'模组查询出错了（{e}），稍后再试~'
+            msg = f'模组查询出错了（{public_failure_label(e)}），稍后再试~'
         if not msg:
             msg = f'模组站没找到「{keyword}」，换个关键词试试~'
         send_group_msg(msg, api=WIKI_API)
@@ -1904,6 +2338,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     @_reply_scope
     def _sanae_reply_thread(self, event, force=False):
         """@早苗 / !问 独立回复：正则匹配 → DeepSeek API（带工具）→ 早苗 API 发回（完全不走 agent）。"""
+        started = time.monotonic()
         trigger = _ai_reply_trigger(event)
         if not trigger:
             print('[sanae-route] channel=ai blocked=no-invocation message_id={} user={}'.format(
@@ -1929,7 +2364,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                               and not _is_ai_operation_turn(raw, privileged))
             context_reference = ''
             social_style_override = ''
-            # 运维工具的意图识别必须基于干净的当前消息。把长期记忆、黑话或
+            # 运维工具的意图识别必须基于干净的当前消息。把长期记忆或
             # 风格策略拼进来，会让其中的“解释/说明”等词误关掉 run_rcon。
             if gid == SOCIAL_LITE_GROUP and not _is_ai_operation_turn(raw, privileged):
                 social_style_override = FEEDBACK_STORE.style_override(uid, group_id=gid)
@@ -1941,12 +2376,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         extras.append(personal_context)
                 except Exception as exc:
                     print(f'[conversation-memory] context failed: {type(exc).__name__}', flush=True)
-                slang_context = SLANG_LEARNER.context(text=raw)
-                if slang_context:
-                    extras.append(slang_context)
-                memory_context = SOCIAL_MEMORY.context()
-                if memory_context:
-                    extras.append(memory_context)
                 style_hint = SOCIAL_LITE.expression_style_hint(gid, event)
                 if style_hint:
                     extras.append(style_hint)
@@ -1971,6 +2400,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 visual_context = _silent_image_context(event, raw)
                 if visual_context:
                     extras.append(visual_context)
+                server_status = _social_server_status(gid, raw)
+                if server_status:
+                    extras.append(server_status)
                 context_reference = '\n'.join(extras)
             def _stream(part):
                 return _reply_current(event) and _send_ai_text(f'[CQ:at,qq={uid}] {part}', gid)
@@ -1991,6 +2423,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                           reply_metadata=reply_metadata)
             if not reply_metadata.get('model_answer'):
                 _release_expression()
+            if reply and _fun_recently_muted(gid, uid):
+                print(f'[sanae] 已被玩笑禁言，不回复: user={uid}', flush=True)
+                return
             if reply and _reply_current(event):
                 msg = strip_reply_period(f'[CQ:at,qq={uid}] {reply}')
                 body = reply_metadata.get('reply_body', reply)
@@ -2011,9 +2446,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         if attached:
                             sticker['delivered'] = bool(ok)
                 print(f"[sanae] AI回复: trigger={trigger} message_id={event.get('message_id', '')} "
-                      f"user={uid} ok={ok} len={len(reply)}", flush=True)
+                      f"user={uid} ok={ok} len={len(reply)} elapsed={time.monotonic() - started:.1f}s "
+                      f"fallback={int(bool(reply_metadata.get('text_fallback')))} "
+                      f"failure={reply_metadata.get('failure') or '-'}", flush=True)
             else:
-                print(f'[sanae] 非 @早苗 或应忽略，不回复: user={uid} msg={raw[:40]}', flush=True)
+                print(f'[sanae] 非 @早苗 或应忽略，不回复: user={uid} msg={raw[:40]} '
+                      f"outcome={reply_metadata.get('outcome') or '-'} elapsed={time.monotonic() - started:.1f}s", flush=True)
         except Exception as e:
             print(f'[sanae] 回复异常: {e}', flush=True)
             if not _reply_current(event):
@@ -2026,23 +2464,27 @@ class BridgeHandler(BaseHTTPRequestHandler):
     @_reply_scope
     def _social_reply_thread(self, event, context):
         """Social Lite callback: one text-only model turn, no server tools."""
+        started = time.monotonic()
+        reply_metadata = {}
         try:
             uid = str(event.get('user_id') or '')
             gid = event.get('group_id', LLBOT_GROUP)
             nick = ((event.get('sender') or {}).get('card') or
                     (event.get('sender') or {}).get('nickname') or uid)
             raw = str(event.get('raw_message') or event.get('message') or '').strip()
-            slang_context = SLANG_LEARNER.context(text=raw)
-            memory_context = SOCIAL_MEMORY.context()
             feedback_hint = FEEDBACK_STORE.strategy_hint(uid, group_id=gid)
             social_style_override = FEEDBACK_STORE.style_override(uid, group_id=gid)
             style_hint = SOCIAL_LITE.expression_style_hint(gid, event)
             sticker_rows = STICKER_CATALOG.recommend(raw, limit=3)
-            prompt = (f'【最近群聊上下文（仅用于判断语境，不要复述）】\n'
-                      f'{context[-3000:]}')
+            # She may quote it when asked about the chat; otherwise it is background.
+            prompt = (f'【最近群聊上下文（用于理解语境；被问到聊天记录或刚才聊了什么时可以据此回答，平时不要复述）】\n'
+                      f'{context[-3600:]}')
             visual_context = _silent_image_context(event, raw)
             if visual_context:
                 prompt += '\n\n' + visual_context
+            server_status = _social_server_status(gid, raw)
+            if server_status:
+                prompt += '\n\n' + server_status
             try:
                 personal_context = CONVERSATION_MEMORY.context(gid, uid, raw,
                     message_id=event.get('message_id'))
@@ -2050,10 +2492,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     prompt += '\n\n' + personal_context
             except Exception as exc:
                 print(f'[conversation-memory] context failed: {type(exc).__name__}', flush=True)
-            if slang_context:
-                prompt += '\n\n' + slang_context
-            if memory_context:
-                prompt += '\n\n' + memory_context
             learned = '' if social_style_override else _expression_context(gid, uid, raw)
             if learned:
                 prompt += '\n\n' + learned
@@ -2069,7 +2507,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if sticker_rows:
                 moods = '、'.join(dict.fromkeys(x['mood'] for x in sticker_rows))
                 prompt += f'\n〖可选贴纸语义〗{moods}（仅在确有必要时考虑，不要输出贴纸 ID）'
-            reply_metadata = {}
             reply = _sanae_ai.sanae_reply(
                 raw, uid, nick, privileged=False, group_id=gid,
                 force=True, social_only=True, include_usage_footer=False, context_reference=prompt,
@@ -2078,13 +2515,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 reply_metadata=reply_metadata)
             if not reply_metadata.get('model_answer'):
                 _release_expression()
-            if not reply or not _reply_current(event) or reply.strip().upper() == '[SILENT]':
+            if not _reply_current(event):
+                _social_outcome(event, 'stale', started, reply_metadata)
+                return
+            if not reply or reply.strip().upper() == '[SILENT]':
+                _social_outcome(event, reply_metadata.get('outcome') or 'silent', started, reply_metadata)
+                return
+            if _fun_recently_muted(gid, uid):
+                _social_outcome(event, 'muted', started, reply_metadata)
                 return
             body = reply_metadata.get('reply_body', reply)
             # The same cadence as direct chat, without a mention or bot label.
             delivered = _send_social_answer(event, raw, body, reply, gid,
                 learn=reply_metadata.get('social_reply') is True,
                 stickers=reply_metadata.get('model_answer') is True)
+            _social_outcome(event, 'replied' if delivered else 'send-failed', started, reply_metadata)
             if delivered:
                 try:
                     _commit_social_outgoing(event, reply.strip())
@@ -2093,7 +2538,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 print(f'[social-lite] replied group={gid} user={uid} len={len(reply)}', flush=True)
         except Exception as exc:
             print(f'[social-lite] callback failed: {type(exc).__name__}', flush=True)
+            _social_outcome(event, 'error', started, dict(reply_metadata, failure=type(exc).__name__))
             if not _reply_current(event):
+                return
+            try:
+                explicit = SOCIAL_LITE.is_explicit_interaction(event)
+            except Exception:
+                explicit = False
+            if not explicit:
+                # An uninvited chime-in that failed is simply dropped.
                 return
             try:
                 send_group_msg(
@@ -2101,6 +2554,54 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     api=WIKI_API)
             except Exception:
                 pass
+
+    def _console_command_thread(self, event, plan, target, uid, gid):
+        """Smart `!cmd`: read/low run at once, the rest gets a code, free text goes to her."""
+        kind, command, detail = plan
+        started = time.monotonic()
+        prefix = server_prefix(target)
+        backend = _server_query_backend(target)
+        mention = ''
+        try:
+            if kind == 'direct':
+                reply = _rcon_ops.run_console_direct(command, uid, query_fn=backend,
+                                                     server=target, risk=detail)
+            elif kind == 'confirm':
+                try:
+                    online = query_server(target, 'list')
+                except Exception:
+                    online = ''
+                # Reviewed before the code exists, so the 90 s window is not spent waiting.
+                note = _sanae_ai.console_review_note(command, detail, online)
+                reply = _rcon_ops.dispatch('cmd ' + command, uid, uid, True,
+                                           query_fn=backend, server=target)
+                if note and '[高危确认]' in str(reply):
+                    reply = f'八千代复核：{note}\n{reply}'
+            else:
+                mention = f'[CQ:at,qq={uid}] '
+                sender = event.get('sender') or {}
+                nick = sender.get('card') or sender.get('nickname') or ''
+
+                def _interim(message):
+                    try:
+                        send_group_msg(strip_reply_period(mention + message), api=WIKI_API)
+                    except Exception as exc:
+                        print(f'[rcon] 智能控制台 interim 失败: {type(exc).__name__}', flush=True)
+                reply = _sanae_ai.sanae_reply(
+                    command, uid, nick, privileged=True, group_id=gid, send_cb=_interim,
+                    force=True, selected_server=target, explicit_server=True,
+                    console_request=True)
+                reply = reply or '这条没能理解成可以执行的命令，换个说法或直接写完整命令再发一次 !cmd。'
+            reply = f'{mention}{prefix} {reply}'
+            if '[高危确认]' in reply and len(list_servers()) > 1:
+                reply = reply.replace('发送：!确认', f'发送：{prefix} !确认')
+        except Exception as exc:
+            print(f'[rcon] 智能控制台异常: {type(exc).__name__}: {exc}', flush=True)
+            reply = f'{mention}{prefix} [控制台] 这次没处理完（{public_failure_label(exc)}），不会自动重试。'
+        _rcon_ops.record_command_result('cmd ' + command, uid, reply)
+        ok = _send_ai_text(reply, gid) if kind == 'ai' else send_group_msg(reply, api=WIKI_API)
+        print(f"[rcon] 智能控制台完成: user={uid} kind={kind} cmd={command[:40]} "
+              f"target={target['id']} ok={ok} elapsed={time.monotonic() - started:.1f}s", flush=True)
 
     def _screenshot_reply_thread(self, raw):
         try:
@@ -2193,9 +2694,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
         pass
 
 if __name__ == '__main__':
-    print('[sanae-fusion] persona=1.1 sourced-memory=1 turns=1 scoped-feedback=1 expression-learning=1 batch=24 cooldown=600s', flush=True)
+    print(f'[sanae-fusion] persona=1.1 sourced-memory=1 turns=1 scoped-feedback=1 expression-learning={int(EXPRESSION_LEARNING_ENABLED)} batch=24 cooldown=600s', flush=True)
     print(f'[silent-vision] enabled={int(SILENT_VISION_ENABLED)} group={SOCIAL_LITE_GROUP} ttl=900s worker=1', flush=True)
     _sanae_ai.start_pricing_refresh()
+    if FUN_MUTE_AI_ENABLED:
+        FUN_MUTE_JUDGE.start()
+        print(f'[fun-mute] AI judge enabled group={FUN_MUTE_GROUP}', flush=True)
+    for _bug_judge_thread in _BUG_JUDGES.values():
+        _bug_judge_thread.start()
+    if BUG_REPORT_GROUPS:
+        threading.Thread(target=_bug_digest_loop, name='bug-digest', daemon=True).start()
+        print(f'[bug-report] collector groups={",".join(map(str, sorted(BUG_REPORT_GROUPS)))} '
+              f'digest={",".join(map(str, sorted(BUG_DIGEST_GROUPS))) or "off"} at {BUG_DIGEST_HOUR}:00', flush=True)
     if _os.environ.get('SANAE_ENABLE_BACKUP_WATCH', '1') == '1':
         _backup_watch.start()
     if _os.environ.get('SANAE_ENABLE_NAST_SYNC', '1') == '1':
@@ -2205,7 +2715,15 @@ if __name__ == '__main__':
         # monitor relays player chat and join/advancement/crash/ops events
         # to the configured Legacy groups, with QQ echo filtering.
         import legacy_monitor as _legacy_monitor
+        _legacy_monitor.UPDATE_SUMMARY_FN = _sanae_ai.summarize_mod_update
         threading.Thread(target=_legacy_monitor.main,
                          name='legacy-monitor', daemon=True).start()
+    elif _os.environ.get('SANAE_ENABLE_WEEKLY_REPORT', '0') == '1':
+        # Relay stays off: this thread only samples the server and posts the
+        # scheduled weekly report; chat, joins and alerts are not forwarded.
+        import legacy_monitor as _legacy_monitor
+        _legacy_monitor.UPDATE_SUMMARY_FN = _sanae_ai.summarize_mod_update
+        threading.Thread(target=_legacy_monitor.collect_main,
+                         name='weekly-collector', daemon=True).start()
     print(f"桥接服务启动: 监听 0.0.0.0:{BRIDGE_PORT} → 早苗独立模块体系（!wiki/!mod/RCON/@早苗/G2S/私聊），完全不走 agent", flush=True)
     CallbackServer(('0.0.0.0', BRIDGE_PORT), BridgeHandler, source_ips=CALLBACK_SOURCE_IPS).serve_forever()

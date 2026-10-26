@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import server_watch
+
 TZ = timezone(timedelta(hours=8))
 WEEK = 7 * 86400
 MAX_STREAM = 64 * 1024 * 1024
@@ -29,6 +31,9 @@ _THREAD_LOCK = threading.RLock()
 HEADER = re.compile(r'^\[([^\]]+)\] \[([^\]]+)/(INFO|WARN|ERROR|FATAL)\] \[([^\]]+)\]: (.*)$')
 MC = {'net.minecraft.server.MinecraftServer/', 'net.minecraft.server.dedicated.DedicatedServer/'}
 BACKUP = 'de.melanx.simplebackups.SimpleBackups/'
+LOG_KEYS = ('start', 'stop', 'join', 'leave', 'backup_start', 'backup_complete',
+            'backup_error', 'error_lines')
+GAP_SECONDS = 1800
 
 
 def read_json(path, default=None):
@@ -245,10 +250,33 @@ def scan_logs(server_dir, root, since, now):
         'start', 'stop', 'join', 'leave', 'backup_start', 'backup_complete', 'backup_error', 'error_lines')}, meta
 
 
+def remote_activity(events, available):
+    """Join counts from recorded events; a remote server has no retained logs here."""
+    logs = dict.fromkeys(LOG_KEYS)
+    if available:
+        joins = [row for row in events if row.get('type') == 'join']
+        logs['join'] = len(joins)
+        logs['join_players'] = len({str((row.get('details') or {}).get('player') or '').casefold()
+                                    for row in joins} - {''})
+    return logs
+
+
+def sample_gaps(rows, since, now, threshold=GAP_SECONDS):
+    """Spans longer than threshold without any sample, i.e. the collector was not running."""
+    points = [since] + sorted(row['timestamp'] for row in rows) + [now]
+    return [[a, b] for a, b in zip(points, points[1:]) if b - a > threshold]
+
+
+def _clock(value):
+    # build_report binds a local named stamp, so it cannot call stamp() itself.
+    return datetime.fromtimestamp(value, TZ).strftime('%m-%d %H:%M')
+
+
 def build_report(telemetry, now=None, output_root=None):
     now = float(time.time() if now is None else now)
     since, source = now - WEEK, telemetry.root
     root = Path(output_root or source)
+    remote = bool(getattr(telemetry, 'remote', False))
     with locked(root / 'weekly-generation.lock'):
         perf, perf_meta = stream_rows(source / 'perf-samples.jsonl', since, now)
         events, event_meta = stream_rows(source / 'events.jsonl', since, now)
@@ -262,7 +290,13 @@ def build_report(telemetry, now=None, output_root=None):
         players = [number(r.get('players')) for r in perf if number(r.get('players')) is not None]
         avg = lambda values: sum(values) / len(values) if values else None
         counts = Counter(r.get('type') for r in events if isinstance(r.get('type'), str))
-        logs, log_meta = scan_logs(Path(telemetry.server_dir), root, since, now)
+        if remote:
+            logs = remote_activity(events, event_meta['available'])
+            log_meta = {'available': False, 'remote': True, 'files': 0, 'cached_files': 0,
+                        'issues': [], 'first': None, 'last': None, 'scanned_bytes': 0,
+                        'missing_days': []}
+        else:
+            logs, log_meta = scan_logs(Path(telemetry.server_dir), root, since, now)
         crash_dir = Path(telemetry.server_dir) / 'crash-reports'
         crash_names = set()
         for row in events:
@@ -283,9 +317,10 @@ def build_report(telemetry, now=None, output_root=None):
         age = now - (number(runtime.get('timestamp')) or 0)
         runtime_fresh = 0 <= age <= 180 and runtime.get('tick_parser') == 2
         try:
-            free = shutil.disk_usage(telemetry.server_dir).free / 1024 ** 3
+            free = None if remote else shutil.disk_usage(telemetry.server_dir).free / 1024 ** 3
         except OSError:
             free = None
+        gaps = sample_gaps(perf, since, now) if remote else []
         issues = []
         for label, meta in [('性能采样', perf_meta), ('事件记录', event_meta), ('指纹记录', fp_meta)]:
             if not meta['available']:
@@ -297,6 +332,10 @@ def build_report(telemetry, now=None, output_root=None):
         issues.extend(log_meta['issues'])
         if log_meta['missing_days']:
             issues.append('部分日期没有保留日志：' + '、'.join(log_meta['missing_days']))
+        if gaps:
+            issues.append('采样中断（期间没有数据）：' + '、'.join(
+                f'{_clock(a)}～{_clock(b)}' for a, b in gaps[:3]) +
+                (f' 等 {len(gaps)} 段' if len(gaps) > 3 else ''))
         data = {'schema': 2, 'server': telemetry.server_id, 'prefix': telemetry.prefix,
                 'generated_at': now, 'since': since, 'samples': len(valid),
                 'total_samples': len(perf), 'excluded_samples': len(perf) - len(valid),
@@ -308,21 +347,28 @@ def build_report(telemetry, now=None, output_root=None):
                 'player_samples': len(players), 'avg_players': avg(players),
                 'peak_players': max(players) if players else None,
                 'events': dict(counts), 'logs': logs,
-                'crash_reports': len(crash_names) if crash_dir.is_dir() or event_meta['available'] else None,
-                'backup_ok': backup.get('ok'), 'backup_checked_at': backup.get('generated_at'),
-                'backup_verify_pass': sum(r['details']['ok'] for r in verifies),
-                'backup_verify_batches': len(verifies) if event_meta['available'] else None,
+                # Remote crash reports arrive as events from the SSH crash watcher.
+                'crash_reports': ((len(crash_names) if event_meta['available'] else None) if remote else
+                                  (len(crash_names) if crash_dir.is_dir() or event_meta['available'] else None)),
+                'backup_ok': None if remote else backup.get('ok'),
+                'backup_checked_at': None if remote else backup.get('generated_at'),
+                'backup_verify_pass': 0 if remote else sum(r['details']['ok'] for r in verifies),
+                'backup_verify_batches': None if remote or not event_meta['available'] else len(verifies),
                 'fingerprint_alert_records': sum(r.get('action') in ('first', 'alert', 'critical') for r in fingerprints) if fp_meta['available'] else None,
                 'runtime': runtime if runtime_fresh else {}, 'runtime_age_seconds': age,
                 'free_gib': free, 'sources': {'performance': perf_meta, 'events': event_meta, 'fingerprints': fp_meta, 'logs': log_meta},
-                'issues': issues,
-                'definitions': ['TPS/MSPT 仅计 tick_parser=2 的有限有效值；排除旧解析数据。',
+                'issues': issues, 'remote': remote, 'sample_gaps': gaps,
+                'definitions': REMOTE_DEFINITIONS if remote else ['TPS/MSPT 仅计 tick_parser=2 的有限有效值；排除旧解析数据。',
                     '平均值为采样平均；卡顿样本为 TPS<18 或 MSPT>=50，不等于独立卡顿事故。',
                     '启停、进退服、备份创建、ERROR/FATAL 从保留日志计数；启动为 Done，停止为 Stopping server。',
                     '备份完成与启动为窗口内各自计数，跨窗口任务不组成成功率；核验按已记录的批次计。',
                     '指纹告警记录只含 first/alert/critical；不含聚合摘要，不代表群消息投递数。',
                     '崩溃按报告文件名去重，文件与事件合并；不是进程异常退出次数。',
                     '所有时间为北京时间；缺失数据不填零，保留日志不保证覆盖服务离线时段。']}
+        try:
+            data['players_week'] = server_watch.player_week(source, since, now)
+        except Exception:
+            data['players_week'] = None
         day = datetime.fromtimestamp(now, TZ).strftime('%Y-%m-%d')
         folder = root / 'weekly' / day
         data['report_path'] = str(folder / 'report.txt')
@@ -330,6 +376,16 @@ def build_report(telemetry, now=None, output_root=None):
         atomic_text(folder / 'report.txt', format_report(data, details=True))
         write_json(root / 'weekly-latest.json', data)
         return data
+
+
+REMOTE_DEFINITIONS = [
+    'TPS/MSPT 仅计 tick_parser=2 的有限有效值；排除旧解析数据。',
+    '平均值为采样平均；卡顿样本为 TPS<18 或 MSPT>=50，不等于独立卡顿事故。',
+    '服务器运行在远端主机：在线与性能来自约每分钟一次的 RCON 采样，进服次数来自实时日志记录。',
+    '崩溃按报告文件名去重（含 JVM 致命错误日志）；一次崩溃常产生两份报告，不等于异常退出次数。',
+    '远端的备份和磁盘不在本机采集范围内，周报不统计。',
+    '指纹告警记录只含 first/alert/critical；不含聚合摘要，不代表群消息投递数。',
+    '所有时间为北京时间；缺失数据不填零，采样中断的时段不计入平均。']
 
 
 def fmt(value):
@@ -340,10 +396,35 @@ def stamp(value):
     return datetime.fromtimestamp(value, TZ).strftime('%m-%d %H:%M') if value is not None else '未记录'
 
 
+def format_remote_report(data, fresh, details=False):
+    logs = data['logs']
+    joins = ('未记录' if logs.get('join') is None else
+             f'{logs["join"]}次（{logs.get("join_players") or 0}人）')
+    lines = [f'{data["prefix"]}【周报】最近 7 天', fresh,
+             f'性能 有效样本{data["samples"]} TPS均{fmt(data["avg_tps"])} / 低{fmt(data["min_tps"])}',
+             f'MSPT均{fmt(data["avg_mspt"])} / 峰{fmt(data["max_mspt"])}｜卡顿样本{fmt(data["lag_samples"])}',
+             f'在线 均{fmt(data["avg_players"])} / 峰{fmt(data["peak_players"])}｜进服{joins}',
+             *server_watch.format_week(data.get('players_week')),
+             f'可靠 崩溃报告{fmt(data["crash_reports"])}份｜错误 指纹告警记录{fmt(data["fingerprint_alert_records"])}（不含聚合摘要）',
+             f'性能覆盖 {stamp(data["performance_first"])}～{stamp(data["performance_last"])}；排除旧版/无效采样{data["excluded_samples"]}条',
+             '口径：卡顿按采样计；服务器在远端主机，备份和磁盘不在统计内。']
+    if data['issues']:
+        lines.append('部分数据缺失或读取不完整，详见 !周报 详情。')
+    if details:
+        lines.append(f'统计窗口 {stamp(data["since"])}～{stamp(data["generated_at"])}（北京时间）')
+        lines.extend(data['definitions'])
+        lines.extend('数据说明：' + issue for issue in data['issues'][:12])
+    else:
+        lines.append('详情 !周报 详情 / !体检；每周一 20:00 发玩家群。')
+    return '\n'.join(lines)
+
+
 def format_report(data, details=False):
     runtime, logs = data.get('runtime', {}), data['logs']
     fresh = (f'实时 在线{fmt(runtime.get("players"))} TPS{fmt(runtime.get("tps"))} MSPT{fmt(runtime.get("mspt"))}'
              f'（{max(0, int(data["runtime_age_seconds"]))}秒前）') if runtime else '实时 暂无新鲜采样'
+    if data.get('remote'):
+        return format_remote_report(data, fresh, details)
     lines = [f'{data["prefix"]}【周报】最近 7 天', fresh,
              f'性能 有效样本{data["samples"]} TPS均{fmt(data["avg_tps"])} / 低{fmt(data["min_tps"])}',
              f'MSPT均{fmt(data["avg_mspt"])} / 峰{fmt(data["max_mspt"])}｜卡顿样本{fmt(data["lag_samples"])}',
@@ -368,13 +449,22 @@ def format_report(data, details=False):
     return '\n'.join(lines)
 
 
-def publish_due(telemetry, push_fn, group_id, now=None, config=None):
-    """One claimed attempt per scheduled week, including ambiguous receipts.
+def _combined(statuses):
+    values = list(statuses)
+    return values[0] if len(set(values)) == 1 else ','.join(values)
 
-    A durable 'sending' claim survives crashes. It must never be replayed because
-    OneBot has no idempotency key. Failures are retained for operator inspection.
+
+def publish_due(telemetry, push_fn, group_id, now=None, config=None):
+    """One claimed attempt per scheduled week and group, including ambiguous receipts.
+
+    group_id may be one group or several; the report is generated once and each
+    group has its own ledger entry ("<due>#<group>"). A durable 'sending' claim
+    survives crashes and is never replayed, because OneBot has no idempotency
+    key. Failures are retained for operator inspection.
     """
     now = float(time.time() if now is None else now)
+    groups = list(dict.fromkeys(int(g) for g in (
+        group_id if isinstance(group_id, (list, tuple, set, frozenset)) else [group_id])))
     if config is None:
         config = read_json(Path(__file__).with_name('weekly-report-config.json'), {})
     if not config or not config.get('enabled') or config.get('server') != telemetry.server_id:
@@ -395,11 +485,25 @@ def publish_due(telemetry, push_fn, group_id, now=None, config=None):
         if not isinstance(state, dict) or not isinstance(state.get('deliveries'), dict):
             raise ValueError('weekly delivery ledger unreadable')
         deliveries = state['deliveries']
-        old = deliveries.get(key, {})
-        if old.get('status') in ('sending', 'sent', 'uncertain'):
-            return old['status']
-        if old.get('retry_after', 0) > now:
-            return 'generation-backoff'
+
+        def previous(group):
+            entry = deliveries.get(f'{key}#{group}')
+            legacy = deliveries.get(key)  # single-group ledger before 2026-10-25
+            if entry is None and isinstance(legacy, dict) and legacy.get('group_id') == group:
+                entry = legacy
+            return entry or {}
+
+        statuses, todo = {}, []
+        for group in groups:
+            old = previous(group)
+            if old.get('status') in ('sending', 'sent', 'uncertain'):
+                statuses[group] = old['status']
+            elif old.get('retry_after', 0) > now:
+                statuses[group] = 'generation-backoff'
+            else:
+                todo.append(group)
+        if not todo:
+            return _combined(statuses[g] for g in groups)
         try:
             report = telemetry.weekly_report(now=now)
             message = telemetry.format_weekly(report)
@@ -407,22 +511,26 @@ def publish_due(telemetry, push_fn, group_id, now=None, config=None):
             write_json(archive / 'report.json', report)
             atomic_text(archive / 'report.txt', format_report(report, details=True))
         except Exception as exc:
-            deliveries[key] = {'status': 'generation-failed', 'retry_after': now + 1800,
-                               'error_type': type(exc).__name__}
+            for group in todo:
+                deliveries[f'{key}#{group}'] = {'status': 'generation-failed', 'retry_after': now + 1800,
+                                                'error_type': type(exc).__name__, 'group_id': group}
+                statuses[group] = 'generation-failed'
             write_json(state_path, state)
-            return 'generation-failed'
-        entry = {'status': 'sending', 'scheduled_at': due.timestamp(), 'attempted_at': now,
-                 'group_id': int(group_id), 'report_path': str(archive / 'report.json')}
-        deliveries[key] = entry
-        state['deliveries'] = dict(sorted(deliveries.items())[-60:])
-        write_json(state_path, state)
-        try:
-            accepted = push_fn(message, group_id) is True
-            entry['status'] = 'sent' if accepted else 'uncertain'
-        except Exception as exc:
-            entry.update(status='uncertain', error_type=type(exc).__name__)
-        entry['finished_at'] = time.time()
-        write_json(state_path, state)
-        if entry['status'] == 'uncertain':
-            logging.getLogger(__name__).warning('Weekly delivery receipt uncertain; automatic replay suppressed. See weekly-delivery.json.')
-        return entry['status']
+            return _combined(statuses[g] for g in groups)
+        for group in todo:
+            entry = {'status': 'sending', 'scheduled_at': due.timestamp(), 'attempted_at': time.time(),
+                     'group_id': group, 'report_path': str(archive / 'report.json')}
+            deliveries[f'{key}#{group}'] = entry
+            state['deliveries'] = deliveries = dict(sorted(deliveries.items())[-120:])
+            write_json(state_path, state)
+            try:
+                accepted = push_fn(message, group) is True
+                entry['status'] = 'sent' if accepted else 'uncertain'
+            except Exception as exc:
+                entry.update(status='uncertain', error_type=type(exc).__name__)
+            entry['finished_at'] = time.time()
+            write_json(state_path, state)
+            if entry['status'] == 'uncertain':
+                logging.getLogger(__name__).warning('Weekly delivery receipt uncertain; automatic replay suppressed. See weekly-delivery.json.')
+            statuses[group] = entry['status']
+        return _combined(statuses[g] for g in groups)

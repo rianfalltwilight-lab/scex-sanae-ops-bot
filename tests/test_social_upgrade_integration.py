@@ -63,7 +63,7 @@ class UpgradeIntegrationTests(FusionCase):
         image = self.at('看看这个', '5')
         image['message'].append({'type': 'image', 'data': {'url': 'https://invalid.test/a.png'}})
         events.append(image)
-        other = self.at('今天吃面', '6'); other['group_id'] = 1003
+        other = self.at('今天吃面', '6'); other['group_id'] = 2104
         events.append(other)
         for event in events:
             QUEUE(mock.Mock(), event)
@@ -191,3 +191,17 @@ class UpgradeIntegrationTests(FusionCase):
         self.assertEqual(thread.call_args.kwargs['target'], bridge._learn_expressions)
         self.assertEqual(thread.call_args.kwargs['args'], (batch,))
         self.ai_worker.assert_not_called()
+
+    def test_expression_learning_off_neither_observes_nor_injects(self):
+        self.expression.observe.return_value = True
+        self.expression.reserve.return_value = ('〖学到的表达〗fixture', 'ticket')
+        with mock.patch.object(bridge, 'EXPRESSION_LEARNING_ENABLED', False), \
+                mock.patch.object(bridge.threading, 'Thread') as thread:
+            self.handler._process_event(self.event('今天天气挺好', mid='8'))
+            self.assertEqual('', bridge._expression_context(
+                bridge.SOCIAL_LITE_GROUP, '2001', '今天天气挺好'))
+        self.expression.observe.assert_not_called()
+        self.expression.prepare_batch.assert_not_called()
+        self.expression.reserve.assert_not_called()
+        self.assertNotIn(bridge._learn_expressions,
+                         [call.kwargs.get('target') for call in thread.call_args_list])

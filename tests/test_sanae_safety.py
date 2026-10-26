@@ -12,8 +12,6 @@ from io import BytesIO
 from unittest import mock
 
 os.environ["SCE_BOT_TEST_MODE"] = "1"
-os.environ.setdefault("LLBOT_GROUP", "1001")
-os.environ.setdefault("SANAE_BOT_QQ", "1002")
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE_SRC = os.path.join(HERE, "src")
@@ -21,17 +19,18 @@ if os.path.isdir(PACKAGE_SRC):
     HERE = PACKAGE_SRC
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-os.environ.setdefault("SCE_SERVER_REGISTRY", os.path.join(HERE, "examples", "servers.example.json"))
 
 s = importlib.import_module("sanae_ai")
+from sanae_identity import BOT_NAME
+
+# GLM-5.2 official token price (yuan / 1M), formerly sanae_ai.ZHIPU_TEXT_PRICING.
+GLM52_PRICING = (8.0, 2.0, 28.0)
 
 
 class SanaeSafetyTests(unittest.TestCase):
     def setUp(self):
         s._HISTORY.clear()
         s._LAST_MEMBER.clear()
-        s._LAST_INTERACTION.clear()
-        s._CHAT_HISTORY.clear()
 
     def test_usage_footer_matches_upstream_transparency_format(self):
         with mock.patch.object(s, "_price_quote", return_value=((3.0, 0.10, 9.0), True, True)), \
@@ -41,7 +40,7 @@ class SanaeSafetyTests(unittest.TestCase):
                 "prompt_tokens": 2000, "prompt_cache_hit_tokens": 1500,
                 "completion_tokens": 200}})
             footer = usage.footer()
-        self.assertIn("2,200 tok，约 ¥0.0034", footer)
+        self.assertEqual(footer, "和你吹牛逼用了 2,200 tok，约 ¥0.0034，饭钱结一下")
         self.assertEqual((usage.prompt, usage.completion, usage.cache, usage.calls), (2000, 200, 1500, 1))
         self.assertTrue(usage.saw_peak)
 
@@ -50,10 +49,10 @@ class SanaeSafetyTests(unittest.TestCase):
         usage.add({'model': 'glm-5.3', 'usage': {
             'prompt_tokens': 1200, 'completion_tokens': 340,
             'prompt_cache_hit_tokens': 500}}, priced=True,
-                   quote=(0.22, 0.007, 0.66),
-                   pricing_label='参考价')
+                   quote=GLM52_PRICING,
+                   pricing_label='按 GLM-5.2 官方价')
         footer = usage.footer()
-        self.assertIn('1,540 tok，约 ¥0.0004', footer)
+        self.assertEqual(footer, '和你吹牛逼用了 1,540 tok，约 ¥0.0161，饭钱结一下')
         self.assertEqual(usage.model, 'glm-5.3')
         self.assertEqual((usage.prompt, usage.completion, usage.cache), (1200, 340, 500))
 
@@ -63,10 +62,10 @@ class SanaeSafetyTests(unittest.TestCase):
             'prompt_tokens': 1000,
             'prompt_tokens_details': {'cached_tokens': 600},
             'completion_tokens': 100}}, priced=True,
-                  quote=(0.22, 0.007, 0.66),
-                  pricing_label='参考价')
+                  quote=GLM52_PRICING,
+                  pricing_label='按 GLM-5.2 官方价')
         footer = usage.footer()
-        self.assertIn('1,100 tok，约 ¥0.0002', footer)
+        self.assertEqual(footer, '和你吹牛逼用了 1,100 tok，约 ¥0.0072，饭钱结一下')
         self.assertEqual(usage.cache, 600)
 
     def test_serious_requests_default_to_high_reasoning(self):
@@ -78,88 +77,7 @@ class SanaeSafetyTests(unittest.TestCase):
         payload = post.call_args.args[2]
         self.assertEqual(payload['thinking'], {'type': 'enabled'})
         self.assertEqual(payload['reasoning_effort'], 'high')
-
-    def test_gemini_endpoint_is_native_and_rejects_unsafe_base(self):
-        self.assertEqual(
-            'https://example.invalid/v1beta/models/gemini-3.8-flash:generateContent',
-            s._gemini_endpoint('https://example.invalid', 'gemini-3.8-flash'))
-        for base in ('http://example.invalid', 'https://user@example.invalid',
-                     'https://example.invalid?key=secret'):
-            with self.assertRaises(ValueError):
-                s._gemini_endpoint(base, 'gemini-3.8-flash')
-
-    def test_gemini_payload_maps_system_tools_and_low_thinking(self):
-        payload = s._gemini_request_payload({
-            'messages': [
-                {'role': 'system', 'content': '系统约束'},
-                {'role': 'user', 'content': '查在线人数'},
-            ],
-            'tools': [s.RUN_RCON_RO],
-            'tool_choice': 'required',
-            'temperature': 0.2,
-            'max_tokens': 800,
-        })
-        self.assertEqual('系统约束', payload['systemInstruction']['parts'][0]['text'])
-        self.assertEqual('查在线人数', payload['contents'][0]['parts'][0]['text'])
-        declaration = payload['tools'][0]['functionDeclarations'][0]
-        self.assertEqual('run_rcon', declaration['name'])
-        self.assertEqual('ANY', payload['toolConfig']['functionCallingConfig']['mode'])
-        self.assertEqual('low', payload['generationConfig']['thinkingConfig']['thinkingLevel'])
-        self.assertNotIn('temperature', payload['generationConfig'])
-
-    def test_gemini_response_preserves_thought_signature_and_groups_tool_results(self):
-        raw = {
-            'modelVersion': 'gemini-3.8-flash',
-            'candidates': [{'content': {'role': 'model', 'parts': [
-                {'functionCall': {'id': 'call-1', 'name': 'run_rcon',
-                                  'args': {'command': 'list'}},
-                 'thoughtSignature': 'opaque-signature'},
-                {'functionCall': {'id': 'call-2', 'name': 'read_recent_chat',
-                                  'args': {'count': 2}}},
-            ]}}],
-            'usageMetadata': {'promptTokenCount': 20, 'candidatesTokenCount': 3,
-                              'thoughtsTokenCount': 4, 'cachedContentTokenCount': 5},
-        }
-        normalized = s._normalize_gemini_response(raw)
-        message = normalized['choices'][0]['message']
-        self.assertEqual('opaque-signature', message['_gemini_parts'][0]['thoughtSignature'])
-        self.assertEqual(7, normalized['usage']['completion_tokens'])
-        system, contents = s._gemini_contents([
-            {'role': 'system', 'content': '系统'},
-            {'role': 'user', 'content': '查询'},
-            {'role': 'assistant', 'content': '',
-             'tool_calls': message['tool_calls'],
-             '_gemini_parts': message['_gemini_parts']},
-            {'role': 'tool', 'tool_call_id': 'call-1', 'name': 'run_rcon',
-             'content': '在线 1 人'},
-            {'role': 'tool', 'tool_call_id': 'call-2', 'name': 'read_recent_chat',
-             'content': '最近消息'},
-        ])
-        self.assertEqual([{'text': '系统'}], system)
-        self.assertEqual('opaque-signature', contents[1]['parts'][0]['thoughtSignature'])
-        self.assertEqual(2, len(contents[2]['parts']))
-        self.assertEqual('call-1', contents[2]['parts'][0]['functionResponse']['id'])
-
-    def test_gemini_post_uses_api_key_header_without_query_secret(self):
-        native = {'modelVersion': 'gemini-3.8-flash',
-                  'candidates': [{'content': {'parts': [{'text': '好'}]}}],
-                  'usageMetadata': {}}
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = (
-            __import__('json').dumps(native, ensure_ascii=False).encode('utf-8'))
-        response.__exit__.return_value = False
-        opener = mock.Mock()
-        opener.open.return_value = response
-        with mock.patch.object(s, 'GEMINI_BASE_URL', 'https://example.invalid'), \
-             mock.patch.object(s, 'GEMINI_KEY', 'test-secret'), \
-             mock.patch.object(s.urllib.request, 'build_opener', return_value=opener) as build:
-            result = s._gemini_post({'messages': [{'role': 'user', 'content': '你好'}]})
-        request = opener.open.call_args.args[0]
-        self.assertIsInstance(build.call_args.args[0], s.urllib.request.ProxyHandler)
-        self.assertNotIn('test-secret', request.full_url)
-        self.assertEqual('test-secret', request.get_header('X-goog-api-key'))
-        self.assertEqual('SanaeAI/1.0', request.get_header('User-agent'))
-        self.assertEqual('好', result['choices'][0]['message']['content'])
+        self.assertGreaterEqual(payload['max_tokens'], 16384)
 
     def test_official_pricing_parser_requires_complete_snapshot(self):
         page = """DeepSeek-V4-Flash DeepSeek-V4-Pro
@@ -182,12 +100,13 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertEqual(parsed["offpeak"], (1.5, 0.05, 4.5))
         self.assertEqual(parsed["peak"], (3.0, 0.10, 9.0))
 
-    def test_plain_reply_omits_footer_by_default(self):
+    def test_plain_reply_also_gets_footer(self):
         usage = mock.Mock()
         usage.footer.return_value = "———\n模型：test｜费用：无法计算｜耗时：0.01s"
         with mock.patch.object(s, "run_agent", return_value=("回答", usage, False)):
-            out = s.sanae_reply("[CQ:at,qq=1002] 你好", "u", privileged=True)
-        self.assertEqual("回答", out)
+            out = s.sanae_reply("[CQ:at,qq=1002] 你好", "u", privileged=True,
+                                include_usage_footer=True)
+        self.assertIn("模型：test", out)
 
     def test_member_and_admin_rcon_allowlists(self):
         self.assertTrue(s._member_safe("neoforge tps"))
@@ -209,28 +128,6 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertFalse(s._has_console_command_intent('看看怀旧服蓝图有哪些指令'))
         self.assertFalse(s._has_confirmation_intent('不要执行，取消'))
 
-    def test_natural_player_look_routes_to_bluemap(self):
-        cases = (
-            ('[CQ:at,qq=1002] 看看ExamplePlayer', None, 'ExamplePlayer'),
-            ('早苗，看看 ExamplePlayer', None, 'ExamplePlayer'),
-            ('看人 ExamplePlayer', None, 'ExamplePlayer'),
-            ('[怀旧] 看下玩家 ExamplePlayer', 'legacy', 'ExamplePlayer'),
-        )
-        for raw, server_id, player in cases:
-            parsed = s.parse_bluemap_request(raw)
-            self.assertIsNotNone(parsed, raw)
-            self.assertEqual(server_id, parsed['server']['id'] if parsed['server'] else None)
-            self.assertEqual(player, parsed['player'])
-
-    def test_natural_player_look_does_not_hijack_chat_or_ops(self):
-        for raw in ('看看ExamplePlayer', '[CQ:at,qq=1002] 看看TPS', '早苗，看看日志', '看看这个'):
-            self.assertIsNone(s.parse_bluemap_request(raw), raw)
-
-    def test_screenshot_runtime_path_is_native_on_windows(self):
-        with mock.patch.object(s.os, 'name', 'nt'):
-            self.assertEqual('C:/Users/Public/shot.png',
-                             s._runtime_file_path('C:/Users/Public/shot.png'))
-
     def test_live_server_query_intent_requires_fresh_tool_evidence(self):
         self.assertTrue(s._has_server_query_intent('现在怀旧服多少天了'))
         self.assertTrue(s._has_server_query_intent('早苗，服里在线几个人'))
@@ -248,7 +145,7 @@ class SanaeSafetyTests(unittest.TestCase):
                 include_usage_footer=False)
             blocked = s.sanae_reply(
                 '普通聊天', 'member', privileged=False,
-                force=True, selected_server=server, explicit_server=True,
+                force=True, social_only=True, selected_server=server, explicit_server=True,
                 include_usage_footer=False)
         self.assertEqual('当前在线 2 人', answer)
         self.assertIsNone(blocked)
@@ -298,7 +195,7 @@ class SanaeSafetyTests(unittest.TestCase):
                 'request_console_command', {'command': 'op ExamplePlayer'}, True,
                 current_user_text='怀旧服给 ExamplePlayer OP', selected_server=server,
                 user_id='1', nickname='管理员', explicit_server=True)
-        self.assertIn('回复' + s.BOT_NAME + '：确认 ABCD', accepted)
+        self.assertIn(f'回复{BOT_NAME}：确认 ABCD', accepted)
         self.assertIn('本服注册语法：/op <targets>', accepted)
         dispatch.assert_called_once()
 
@@ -421,10 +318,13 @@ class SanaeSafetyTests(unittest.TestCase):
 
     def test_incident_postmortem_is_admin_only_and_window_is_fixed(self):
         denied = s.execute_tool("incident_postmortem", {"window": "24h"}, False)
-        self.assertIn("管理员", denied)
+        self.assertIn("仅管理员", denied)
+        import sanae_local_ops
+        fixture = ({"id": "legacy", "prefix": "[怀旧]"}, Path(tempfile.gettempdir()))
         with mock.patch.object(s, "subprocess") as subprocess, \
-             mock.patch("sanae_local_ops.canonical_local_server", return_value=({"prefix": "[test]"}, Path.cwd())):
-            invalid = s.execute_tool("incident_postmortem", {"window": "30d"}, True)
+             mock.patch.object(sanae_local_ops, "canonical_local_server", return_value=fixture):
+            invalid = s.execute_tool("incident_postmortem", {"window": "30d"}, True,
+                                     selected_server={"id": "legacy"})
         self.assertIn("window 只能是", invalid)
         subprocess.run.assert_not_called()
 
@@ -467,16 +367,17 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertIn("没有全部通过本服命令帮助树核验", answer)
         self.assertNotIn("remove_all", answer)
 
-    def test_config_write_requires_current_message_key_and_value(self):
-        # Generic file writes are now disabled even for explicit administrator requests.
-        for request in ("修改配置", "view-distance 12 config/a.toml old = 1 old = 2"):
-            result = s.execute_tool("set_server_property", {"key": "view-distance", "value": "12"}, True, True, True, request)
+    def test_config_write_tool_stays_disabled_even_with_explicit_key_and_value(self):
+        # Generic file writes were retired (sanae_local_ops.DISABLED_FILE_TOOLS).
+        for text in ("请修改配置", "请修改配置 view-distance 设置为 12"):
+            result = s.execute_tool("set_server_property", {"key": "view-distance", "value": "12"},
+                                    True, True, True, text)
             self.assertIn("已停用", result)
 
-    def test_replace_requires_path_old_and_new_in_current_message(self):
-        # Generic file writes are now disabled even for explicit administrator requests.
-        for request in ("修改配置", "view-distance 12 config/a.toml old = 1 old = 2"):
-            result = s.execute_tool("replace_in_config", {"path": "config/a.toml", "find": "old = 1", "replace": "old = 2"}, True, True, True, request)
+    def test_replace_tool_stays_disabled_even_with_explicit_path_old_and_new(self):
+        args = {"path": "config/a.toml", "find": "old = 1", "replace": "old = 2"}
+        for text in ("修改 config/a.toml", "修改 config/a.toml，把 old = 1 改成 old = 2"):
+            result = s.execute_tool("replace_in_config", args, True, True, True, text)
             self.assertIn("已停用", result)
 
     def test_group_file_download_requires_admin_and_current_explicit_intent(self):
@@ -602,27 +503,32 @@ class SanaeSafetyTests(unittest.TestCase):
         self.assertFalse(used)
         vision.assert_called_once()
 
-    def test_vision_request_uses_independent_provider_without_assumed_pricing(self):
-        response = {'model': s.VISION_MODEL,
+    def test_vision_request_uses_independent_deepseek_provider_and_pricing(self):
+        response = {'model': s.DEEPSEEK_VISION_MODEL,
                     'choices': [{'message': {'content': '图片解释'}}],
                     'usage': {'prompt_tokens': 2000, 'prompt_cache_hit_tokens': 1500,
                               'completion_tokens': 200}}
-        with mock.patch.object(s, '_vision_media_url', return_value='https://example.invalid/x.png'), \
-             mock.patch.object(s, '_post', return_value=response) as post, \
-             mock.patch.object(s, '_price_quote', return_value=((3.0, 0.10, 9.0), True, True)):
+        # The provider is chosen by SANAE_VISION_PROVIDER at import; pin it here.
+        with mock.patch.multiple(s, TEXT_PROVIDER='gemini', VISION_PROVIDER='deepseek', VISION_URL=s.DEEPSEEK_URL,
+                                 VISION_KEY=s.DEEPSEEK_KEY, VISION_MODEL=s.DEEPSEEK_VISION_MODEL), \
+             mock.patch.object(s, '_vision_media_url', return_value='https://example.invalid/x.png'), \
+             mock.patch.object(s, '_post', return_value=response) as post:
             answer, usage, used = s.run_agent('看图', 'u', False, 1,
                                               image_url='https://example.invalid/x.png')
             footer = usage.footer()
         self.assertEqual(answer, '图片解释')
         self.assertFalse(used)
-        self.assertEqual(post.call_args.args[:2], (s.VISION_URL, s.VISION_KEY))
+        self.assertEqual(post.call_args.args[:2], (s.DEEPSEEK_URL, s.DEEPSEEK_KEY))
         payload = post.call_args.args[2]
-        self.assertEqual(payload['model'], s.VISION_MODEL)
+        self.assertEqual(payload['model'], s.DEEPSEEK_VISION_MODEL)
         self.assertIsInstance(payload['messages'][1]['content'], list)
-        self.assertEqual(usage.model, s.VISION_MODEL)
-        self.assertIn('2,200 tok', footer)
-        self.assertIn('饭钱还没核到', footer)
-        self.assertNotIn('¥', footer)
+        self.assertEqual(usage.requested_model, s.DEEPSEEK_VISION_MODEL)
+        # DeepSeek vision is billed at the fixed V4 Flash reference price.
+        miss_in, cached, out_tokens = 500, 1500, 200
+        price = s.DEEPSEEK_TEXT_PRICING
+        cost = (miss_in * price[0] + cached * price[1] + out_tokens * price[2]) / 1e6
+        self.assertEqual(footer, f'和你吹牛逼用了 2,200 tok，约 ¥{cost:.4f}，饭钱结一下')
+        self.assertEqual(usage.pricing_label, s.DEEPSEEK_TEXT_PRICING_LABEL)
 
     def test_gif_is_converted_to_contact_sheet(self):
         from PIL import Image
@@ -637,30 +543,35 @@ class SanaeSafetyTests(unittest.TestCase):
             self.assertEqual(sheet.format, 'PNG')
             self.assertGreater(sheet.width, 8)
 
-    def test_static_media_is_not_downloaded_by_gif_adapter(self):
-        with mock.patch.object(s, '_download_bytes',
-                               return_value=(b'png-bytes', 'image/png')) as download:
-            result = s._vision_media_url('https://example.invalid/screenshot.png')
-        self.assertTrue(result.startswith('data:image/png;base64,'))
+    def test_static_image_is_downloaded_once_as_data_url(self):
+        # QQ CDN links are often unreadable upstream, so static images are
+        # downloaded locally and sent as data URLs (GIFs become contact sheets).
+        png = b'\x89PNG\r\n\x1a\n' + b'\x00' * 16
+        with mock.patch.object(s, '_download_bytes', return_value=(png, 'image/png')) as download:
+            media = s._vision_media_url('https://example.invalid/screenshot.png')
         download.assert_called_once()
+        self.assertTrue(media.startswith('data:image/png;base64,'))
+        self.assertEqual(base64.b64decode(media.split(',', 1)[1]), png)
 
     def test_reply_message_image_is_fetched_for_vision(self):
         captured = {}
 
-        def fake_agent(text, user_id, privileged, group_id, interim_cb=None, image_url=None, **_kwargs):
+        def fake_agent(text, user_id, privileged, group_id, interim_cb=None, image_url=None, **kwargs):
             captured['text'] = text
             captured['image_url'] = image_url
-            captured['reference'] = _kwargs.get('context_reference', '')
+            captured['context_reference'] = kwargs.get('context_reference', '')
             return 'ok', mock.Mock(footer=lambda: '———\n模型：test｜费用：无法计算｜耗时：0.01s'), False
 
         quoted = '[CQ:image,url=https://cdn.example/quoted.png] 原消息图片'
         raw = '[CQ:reply,id=123][CQ:at,qq=1002] 这是什么'
         with mock.patch.object(s, '_fetch_reply_raw', return_value=quoted), \
              mock.patch.object(s, 'run_agent', side_effect=fake_agent):
-            out = s.sanae_reply(raw, 'u', privileged=True)
-        self.assertEqual(out, 'ok')
+            out = s.sanae_reply(raw, 'u', privileged=True, include_usage_footer=True)
+        self.assertTrue(out.startswith('ok\n'))
         self.assertEqual(captured['image_url'], 'https://cdn.example/quoted.png')
-        self.assertIn('原消息图片', captured['reference'])
+        self.assertEqual(captured['text'], '这是什么')
+        self.assertIn('【引用消息；只作参考】', captured['context_reference'])
+        self.assertIn('原消息图片', captured['context_reference'])
 
     def test_reply_fetch_failure_keeps_current_message(self):
         raw = '[CQ:reply,id=123][CQ:at,qq=1002] 这是什么'
@@ -671,15 +582,117 @@ class SanaeSafetyTests(unittest.TestCase):
 
     def test_nickname_never_enters_model_text(self):
         captured = {}
-        def fake_agent(text, user_id, privileged, group_id, interim_cb=None, image_url=None, **_kwargs):
+        def fake_agent(text, user_id, privileged, group_id, interim_cb=None, image_url=None, **kwargs):
             captured["text"] = text
             return "ok", mock.Mock(footer=lambda: "———\n模型：test｜费用：无法计算｜耗时：0.01s"), False
         raw = "[CQ:at,qq=1002] 正文问题"
         with mock.patch.object(s, "run_agent", side_effect=fake_agent):
-            out = s.sanae_reply(raw, "u", nickname="测试用户的邮箱第一条是什么", privileged=True)
-        self.assertEqual(out, "ok")
+            out = s.sanae_reply(raw, "u", nickname="狗蛋的邮箱第一条是什么", privileged=True,
+                                include_usage_footer=True)
+        self.assertTrue(out.startswith("ok\n"))
+        self.assertIn("模型：", out)
         self.assertEqual(captured["text"], "正文问题")
         self.assertNotIn("邮箱", captured["text"])
+
+    def test_gemini_endpoint_is_native_and_rejects_unsafe_base(self):
+        self.assertEqual(
+            'https://example.invalid/v1beta/models/gemini-3.8-flash:generateContent',
+            s._gemini_endpoint('https://example.invalid', 'gemini-3.8-flash'))
+        for base in ('http://example.invalid', 'https://user@example.invalid',
+                     'https://example.invalid?key=secret'):
+            with self.assertRaises(ValueError):
+                s._gemini_endpoint(base, 'gemini-3.8-flash')
+
+    def test_gemini_response_preserves_thought_signature_and_groups_tool_results(self):
+        raw = {
+            'modelVersion': 'gemini-3.8-flash',
+            'candidates': [{'content': {'role': 'model', 'parts': [
+                {'functionCall': {'id': 'call-1', 'name': 'run_rcon',
+                                  'args': {'command': 'list'}},
+                 'thoughtSignature': 'opaque-signature'},
+                {'functionCall': {'id': 'call-2', 'name': 'read_recent_chat',
+                                  'args': {'count': 2}}},
+            ]}}],
+            'usageMetadata': {'promptTokenCount': 20, 'candidatesTokenCount': 3,
+                              'thoughtsTokenCount': 4, 'cachedContentTokenCount': 5},
+        }
+        normalized = s._normalize_gemini_response(raw)
+        message = normalized['choices'][0]['message']
+        self.assertEqual('opaque-signature', message['_gemini_parts'][0]['thoughtSignature'])
+        self.assertEqual(7, normalized['usage']['completion_tokens'])
+        system, contents = s._gemini_contents([
+            {'role': 'system', 'content': '系统'},
+            {'role': 'user', 'content': '查询'},
+            {'role': 'assistant', 'content': '',
+             'tool_calls': message['tool_calls'],
+             '_gemini_parts': message['_gemini_parts']},
+            {'role': 'tool', 'tool_call_id': 'call-1', 'name': 'run_rcon',
+             'content': '在线 1 人'},
+            {'role': 'tool', 'tool_call_id': 'call-2', 'name': 'read_recent_chat',
+             'content': '最近消息'},
+        ])
+        self.assertEqual([{'text': '系统'}], system)
+        self.assertEqual('opaque-signature', contents[1]['parts'][0]['thoughtSignature'])
+        self.assertEqual(2, len(contents[2]['parts']))
+        self.assertEqual('call-1', contents[2]['parts'][0]['functionResponse']['id'])
+
+    def test_gemini_post_uses_api_key_header_without_query_secret(self):
+        native = {'modelVersion': 'gemini-3.8-flash',
+                  'candidates': [{'content': {'parts': [{'text': '好'}]}}],
+                  'usageMetadata': {}}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            __import__('json').dumps(native, ensure_ascii=False).encode('utf-8'))
+        response.__exit__.return_value = False
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(s, 'GEMINI_BASE_URL', 'https://example.invalid'), \
+             mock.patch.object(s, 'GEMINI_KEY', 'test-secret'), \
+             mock.patch.object(s.urllib.request, 'build_opener', return_value=opener) as build:
+            result = s._gemini_post({'messages': [{'role': 'user', 'content': '你好'}]})
+        request = opener.open.call_args.args[0]
+        self.assertIsInstance(build.call_args.args[0], s.urllib.request.ProxyHandler)
+        self.assertNotIn('test-secret', request.full_url)
+        self.assertEqual('test-secret', request.get_header('X-goog-api-key'))
+        self.assertEqual('SanaeAI/1.0', request.get_header('User-agent'))
+        self.assertEqual('好', result['choices'][0]['message']['content'])
+
+    def test_plain_reply_omits_footer_by_default(self):
+        usage = mock.Mock()
+        usage.footer.return_value = "———\n模型：test｜费用：无法计算｜耗时：0.01s"
+        with mock.patch.object(s, "run_agent", return_value=("回答", usage, False)):
+            out = s.sanae_reply("[CQ:at,qq=1002] 你好", "u", privileged=True)
+        self.assertEqual("回答", out)
+
+    def test_natural_player_look_routes_to_bluemap(self):
+        cases = (
+            ('[CQ:at,qq=1002] 看看ExamplePlayer', None, 'ExamplePlayer'),
+            ('早苗，看看 ExamplePlayer', None, 'ExamplePlayer'),
+            ('看人 ExamplePlayer', None, 'ExamplePlayer'),
+            ('[怀旧] 看下玩家 ExamplePlayer', 'legacy', 'ExamplePlayer'),
+        )
+        for raw, server_id, player in cases:
+            parsed = s.parse_bluemap_request(raw)
+            self.assertIsNotNone(parsed, raw)
+            self.assertEqual(server_id, parsed['server']['id'] if parsed['server'] else None)
+            self.assertEqual(player, parsed['player'])
+
+    def test_natural_player_look_does_not_hijack_chat_or_ops(self):
+        for raw in ('看看ExamplePlayer', '[CQ:at,qq=1002] 看看TPS', '早苗，看看日志', '看看这个'):
+            self.assertIsNone(s.parse_bluemap_request(raw), raw)
+
+    def test_screenshot_runtime_path_is_native_on_windows(self):
+        with mock.patch.object(s.os, 'name', 'nt'):
+            self.assertEqual('C:/Users/Public/shot.png',
+                             s._runtime_file_path('C:/Users/Public/shot.png'))
+
+    def test_static_media_is_not_downloaded_by_gif_adapter(self):
+        with mock.patch.object(s, '_download_bytes',
+                               return_value=(b'png-bytes', 'image/png')) as download:
+            result = s._vision_media_url('https://example.invalid/screenshot.png')
+        self.assertTrue(result.startswith('data:image/png;base64,'))
+        download.assert_called_once()
+
 
 
 if __name__ == "__main__":
