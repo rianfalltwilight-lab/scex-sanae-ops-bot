@@ -196,6 +196,8 @@ class SilentImageObserverTests(unittest.TestCase):
 
     def test_one_shared_45_second_budget_covers_fetch_decode_and_model(self):
         observed = []
+        # Deadline addition/subtraction can round a few ULPs above 45 seconds.
+        upper_bound = 45 + 1e-9
         def remaining(stage):
             left = ai.remaining_timeout(100)
             observed.append((stage, left))
@@ -208,14 +210,14 @@ class SilentImageObserverTests(unittest.TestCase):
             return self.png, 'image/png'
         def post(*args, **kwargs):
             remaining('model')
-            self.assertLessEqual(kwargs['timeout'], 45)
+            self.assertLessEqual(kwargs['timeout'], upper_bound)
             return self.result
         with mock.patch.object(ai.media_transport, 'onebot', side_effect=onebot), \
              mock.patch.object(ai.media_transport, 'download', side_effect=download), \
              mock.patch.object(ai, '_post', side_effect=post):
             ai.observe_silent_image({'type': 'image', 'url': 'https://media.invalid/image'})
         self.assertEqual([stage for stage, _ in observed], ['onebot', 'download', 'model'])
-        self.assertTrue(all(0 < left <= 45 for _, left in observed))
+        self.assertTrue(all(0 < left <= upper_bound for _, left in observed))
         self.assertGreaterEqual(observed[0][1], observed[-1][1])
 
     def test_cancelled_fetch_does_not_start_a_model_request(self):
