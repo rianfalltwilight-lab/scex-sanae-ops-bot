@@ -22,13 +22,22 @@ from types import MappingProxyType
 UPSTREAM_REVISION = "19de94de25efe149d9364ed6572cd634e8138112"
 REFERENCE_NODES = (
     ("电信", "202.96.128.86"),
-    ("联通", "221.5.88.88"),
+    # DNS servers can rate-limit ping themselves. 10-27 from the game host: 221.5.88.88 lost 30-42 % by
+    # day and 90 % at 20:20, 210.21.196.6 lost 0 % by day but 63 % at 20:20, while the Unicom routers
+    # in front of each lost 0-7 %. 202.99.160.68 lost 0 of 180 at both times.
+    # APNIC RDAP: UNICOM-HE, "China Unicom Hebei province network" (checked 2026-10-27).
+    ("联通", "202.99.160.68"),
     ("移动", "211.136.20.203"),
     # Replaces upstream's incorrectly labelled China Mobile Hubei address.
     # APNIC RDAP identifies 103.27.24.1 as GCableNET / Guangdong Cable.
     # https://rdap.apnic.net/ip/103.27.24.1 (checked 2026-09-20)
     ("广电（广东有线参考节点）", "103.27.24.1"),
 )
+# A second node per carrier for the game-host check: loss that only one of the two shows is that
+# node limiting ping, not the path (both checked with APNIC RDAP on 2026-10-27).
+BACKUP_NODES = {"电信": "202.96.134.133",     # shenzhen12012 (China Telecom Shenzhen)
+                "联通": "119.6.6.6",          # UNICOM-SC, China Unicom Sichuan
+                "移动": "211.136.192.6"}      # CMNET-guangdong
 UPLOAD_URL = "https://speed.cloudflare.com/__up"
 UPLOAD_HOST = "speed.cloudflare.com"
 MODE_LIMITS = MappingProxyType({
@@ -234,7 +243,7 @@ def collect_network(mode: str = "normal") -> dict:
 
 def render_network(result: dict) -> str:
     lines = ["[网络]" + (" 加强档" if result["mode"] == "full" else ""),
-             "▶ 运营商参考节点（服务器侧 ICMP）"]
+             "▶ 运营商参考节点（机器人主机 ICMP；服务器主机实测请问早苗“服务器网络怎么样”）"]
     for node in result["latency"]:
         if node["status"] == "ok":
             value = "<1 ms" if node.get("less_than_1ms") else f"{node['avg_ms']:.1f} ms"
@@ -245,7 +254,7 @@ def render_network(result: dict) -> str:
             value = "未知（无有效 ICMP 回应）"
         lines.append(f"{node['label']}：{value}")
     upload = result["upload"]
-    lines.append("\n▶ 上传带宽（服务器上行）")
+    lines.append("\n▶ 上传带宽（机器人主机上行）")
     if upload["status"] == "ok":
         lines.append(f"上传：约 {upload['mbps']:.1f} Mbps")
         lines.append(f"有效轮次：{upload['successful_rounds']}/{upload['planned_rounds']}"

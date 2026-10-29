@@ -32,7 +32,7 @@ LOADERS = """SI chunk loaders: 3 loaded, 3 working, 35 chunks held
 Rules: switch ON, per loader 25, per player - chunks / - loaders, offline - min, 1.0 EU per chunk, random ticks ON
 minecraft:overworld -14764 87 25285 - L_Morningstar - 25/25 chunks - active
 minecraft:overworld 12832 17 -8225 - (no owner) - 3/3 chunks - active
-minecraft:the_nether 134 128 33469 - NaArCr - 6/7 chunks - active"""
+minecraft:the_nether 134 128 33469 - Alice - 6/7 chunks - active"""
 ENTITIES = """Total: 3210
   895: minecraft:item
   820: minecraft:experience_orb
@@ -79,7 +79,7 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(ws.parse_forceload('Unknown or incomplete command'))
         loaders = ws.parse_chunkloaders(LOADERS)
         self.assertEqual((3, 3, 35, 3), (loaders['loaded'], loaders['working'], loaders['held'], len(loaders['loaders'])))
-        self.assertEqual({'dim': 'minecraft:the_nether', 'x': 134, 'y': 128, 'z': 33469, 'owner': 'NaArCr',
+        self.assertEqual({'dim': 'minecraft:the_nether', 'x': 134, 'y': 128, 'z': 33469, 'owner': 'Alice',
                           'held': 6, 'wanted': 7, 'state': 'active'}, loaders['loaders'][2])
         self.assertEqual('', loaders['loaders'][1]['owner'])
         self.assertEqual((3210, [(895, 'minecraft:item'), (820, 'minecraft:experience_orb'), (179, 'botania:spark'),
@@ -124,7 +124,7 @@ class ReportTests(unittest.TestCase):
         # The nether has no snapshot ticket for SI loaders, so the live "held" total counts.
         self.assertIn('- 下界：强加载 6 个区块；玩家 1 人', member)
         self.assertIn('其他 2 个维度（末地、AE2 空间存储）没有强加载，也没有玩家', member)
-        self.assertIn('按放置人：L_Morningstar 1 个/25 区块、无主 1 个/3 区块、NaArCr 1 个/6 区块', member)
+        self.assertIn('按放置人：L_Morningstar 1 个/25 区块、无主 1 个/3 区块、Alice 1 个/6 区块', member)
         self.assertIn('存档于 10-26 13:51', member)
         self.assertIn('（坐标只对管理员显示。）', member)
         self.assertNotIn('-14764', member)
@@ -140,7 +140,7 @@ class ReportTests(unittest.TestCase):
         admin = ws.format_entities('[怀旧]', ENTITIES, ORBS, 'minecraft:experience_orb', detailed=True)
         self.assertIn('全服实体（实时）共 3210 个，最多的：掉落物（minecraft:item） 895、经验球（minecraft:experience_orb） 820', member)
         self.assertIn('最集中的区块：350、228、165（坐标只对管理员显示）', member)
-        self.assertIn('区块 (-938, 800) 350 个', admin)
+        self.assertIn('区块 (-938, 800)（方块约 x=-15000 z=12808） 350 个', admin)
         self.assertIn('查不到这个实体类型', ws.format_entities('[怀旧]', ENTITIES, 'Can not find', 'x:y'))
         self.assertIn('暂时取不到', ws.format_entities('[怀旧]', ''))
         lag = ws.format_lag('[怀旧]', TPS, PERF, ENTITIES)

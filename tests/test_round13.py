@@ -361,7 +361,7 @@ class WiringTests(unittest.TestCase):
             self.assertIn(tool, s.TOOLS_MEMBER)
             self.assertIn(tool, s.TOOLS_ADMIN)
         self.assertTrue({'quest_progress', 'thaumcraft_progress'} <= s.READ_QUERY_TOOL_NAMES)
-        self.assertEqual(['chunks', 'entities', 'lag', 'machines', 'host'],
+        self.assertEqual(['chunks', 'entities', 'lag', 'machines', 'host', 'players', 'backup'],
                          s.SERVER_WORLD['function']['parameters']['properties']['topic']['enum'])
         server = {'id': 'legacy', 'prefix': '[怀旧]', 'server_dir': 'mirror', 'remote_ssh_host': 'remote-test'}
         answers = {'statistics block-entities byType': BLOCKS, 'statistics block-entities byType 2': BLOCKS_2,

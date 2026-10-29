@@ -183,11 +183,26 @@ class OpsCommandRemoteFlagTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, \
                 mock.patch.object(ops_commands, 'STATE_BASE', Path(temp)), \
                 mock.patch.object(ops_commands, 'server_prefix', return_value='[怀旧]'), \
-                mock.patch.object(ops_commands, '_selected', return_value=(server, '')):
+                mock.patch.object(ops_commands, '_selected', return_value=(server, '')), \
+                mock.patch.object(ops_commands.backup_status, 'read', return_value={
+                    'available': False, 'reason': '未配置测试备份工具'}) as backup_read:
             lag = ops_commands.dispatch_ops_command('!卡顿取证', 1, 2, True)
             backup = ops_commands.dispatch_ops_command('!验备份', 1, 2, True)
         self.assertIn('不能做卡顿取证', lag.text)
+        self.assertIn('备份情况暂时查不到', backup.text)
+        self.assertIn('未配置测试备份工具', backup.text)
+        backup_read.assert_called_once_with()
+
+    def test_other_remote_backup_checks_do_not_use_the_legacy_adapter(self):
+        server = {'id': 'secondary', 'server_dir': '.', 'remote_ssh_host': 'remote-test'}
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(ops_commands, 'STATE_BASE', Path(temp)), \
+                mock.patch.object(ops_commands, 'server_prefix', return_value='[测试服]'), \
+                mock.patch.object(ops_commands, '_selected', return_value=(server, '')), \
+                mock.patch.object(ops_commands.backup_status, 'read') as backup_read:
+            backup = ops_commands.dispatch_ops_command('!验备份', 1, 2, True)
         self.assertIn('无法校验', backup.text)
+        backup_read.assert_not_called()
 
     def test_backup_command_refuses_for_a_remote_server(self):
         import rcon_ops

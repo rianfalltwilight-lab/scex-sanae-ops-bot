@@ -97,3 +97,26 @@ class PlayerBindings:
     def list(self):
         with self._lock:
             return [dict(item) for item in self._by_qq.values()]
+
+
+def known_names(ops_root, online=()):
+    """Game names seen on the server, casefold -> name as written (round 30).
+
+    Sources: the login records, the stats files and who is online now. Binding a name nobody has
+    played under is refused, so a typo or someone else's future name cannot be claimed.
+    """
+    names = {}
+    for file_name in ("login-records.json", "player-stats.json"):
+        try:
+            with open(os.path.join(str(ops_root), file_name), encoding="utf-8") as stream:
+                rows = (json.load(stream) or {}).get("players") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        for row in rows if isinstance(rows, list) else []:
+            name = str(row.get("name") or "") if isinstance(row, dict) else ""
+            if NAME_RE.fullmatch(name):
+                names.setdefault(name.casefold(), name)
+    for name in online or ():
+        if NAME_RE.fullmatch(str(name)):
+            names[str(name).casefold()] = str(name)
+    return names

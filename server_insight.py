@@ -274,7 +274,7 @@ def login_records(ops_root):
     return {str(r.get('name')).casefold(): r for r in data.get('players') or [] if isinstance(r, dict) and r.get('name')}
 
 
-def player_stats(ops_root, player='', top='', limit=10):
+def player_stats(ops_root, player='', top='', limit=10, order='desc'):
     data = _read_json(Path(ops_root) / 'player-stats.json', {}) or {}
     rows = data.get('players') or []
     if not rows:
@@ -283,11 +283,19 @@ def player_stats(ops_root, player='', top='', limit=10):
     note = f'数据来自服务器存档的统计文件，同步于 {when}；玩家在线时的最新进度要等服务器存盘后才会更新。'
     logins = login_records(ops_root)
     top = str(top or '').strip()
+    # 10-28 07:25 "列出全服累计游戏时长最长的三十个玩家" / "在线最短的10名": up to 30, either direction.
+    try:
+        count = max(1, min(int(limit or 10), 30))
+    except (TypeError, ValueError):
+        count = 10
+    ascending = str(order or '').strip() == 'asc'
+    sign = 1 if ascending else -1
+    direction = '（从少到多）' if ascending else ''
     if top == 'logins':
-        ranked = sorted(logins.values(), key=lambda r: -int(r.get('login_count') or 0))[:max(1, min(int(limit or 10), 20))]
+        ranked = sorted(logins.values(), key=lambda r: sign * int(r.get('login_count') or 0))[:count]
         if not ranked:
             return '登录记录还没有从服务器同步过来，稍后再查。'
-        return (f'累计登录次数排行（服务器面板记录了 {len(logins)} 名玩家）：\n'
+        return (f'累计登录次数排行{direction}（服务器面板记录了 {len(logins)} 名玩家）：\n'
                 + '\n'.join(f'{i}. {r["name"]}：{r.get("login_count", 0)} 次（上次 {str(r.get("last_login"))[:16]}）'
                             for i, r in enumerate(ranked, 1))
                 + '\n登录记录来自服务器面板（MSLX），只有面板启用后登录过的玩家。')
@@ -295,8 +303,8 @@ def player_stats(ops_root, player='', top='', limit=10):
         if top not in STAT_FIELDS:
             raise ValueError('top 只能是 ' + '、'.join(STAT_FIELDS))
         ranked = sorted((r for r in rows if isinstance(r.get(top), (int, float))),
-                        key=lambda r: -r[top])[:max(1, min(int(limit or 10), 20))]
-        return (f'{STAT_FIELDS[top]}排行（共 {len(rows)} 名玩家有记录）：\n'
+                        key=lambda r: sign * r[top])[:count]
+        return (f'{STAT_FIELDS[top]}排行{direction}（共 {len(rows)} 名玩家有记录）：\n'
                 + '\n'.join(f'{i}. {r["name"]}：{_fmt(r[top])}' for i, r in enumerate(ranked, 1))
                 + '\n' + note)
     player = str(player or '').strip()

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backup_verify import format_backup_verification
+import backup_status
 from mod_inventory import format_inventory, format_inventory_pages
 from ops_contract import append_jsonl
 from ops_telemetry import OpsTelemetry
@@ -147,6 +148,9 @@ def dispatch_ops_command(raw, group_id, user_id, privileged, query_fn=None):
         elif name == "errors":
             window = command["match"].group(1) or "6h"
             reply = OpsReply(_error_summary(telemetry, window))
+        elif name == "backup" and server.get("remote_ssh_host") and server.get("id") == "legacy":
+            # The Mac world's backups land on this PC (backup_status); the old local snapshot is from 10-14.
+            reply = OpsReply(backup_status.format_status(telemetry.prefix, backup_status.read(), detailed=True))
         elif name in ("lag", "backup") and server.get("remote_ssh_host"):
             # The old local snapshots would look current; say what is possible instead.
             reply = OpsReply(

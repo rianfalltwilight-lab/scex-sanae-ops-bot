@@ -96,12 +96,17 @@ class WebPolishTests(unittest.TestCase):
         self.assertTrue(metadata['web_reply'])
         interim.assert_not_called()
 
-    def test_mixed_first_batch_keeps_interim_and_never_applies_web_style(self):
+    def test_fast_mixed_first_batch_cancels_interim_and_never_applies_web_style(self):
         self.responses = [self.call('web_search', 'list_mods'), self.answer(self.body)]
         interim = mock.Mock()
-        _, metadata = self.reply(send_cb=interim)
+        with mock.patch.object(s.threading, 'Timer') as timer:
+            _, metadata = self.reply(send_cb=interim)
+        timer.assert_called_once()
+        timer.return_value.start.assert_called_once()
+        timer.return_value.cancel.assert_called_once()
         self.assertFalse(metadata['web_reply'])
-        interim.assert_called_once()
+        interim.assert_not_called()
+        self.assertEqual([c.args[0] for c in self.execute.call_args_list], ['web_search', 'list_mods'])
         self.assertNotIn(s._WEB_REPLY_STYLE, self.requests[-1]['messages'][0]['content'])
 
     def test_later_non_web_tool_removes_only_web_instruction(self):

@@ -21,6 +21,9 @@ MAX_CALLS = 32
 MAX_TEXT = 24000
 MAX_REPLY_DEPTH = 2
 MAX_HISTORY_FORWARDS = 6
+# One forwarded record inside a history listing (10-28: a 549-message forward used the whole text
+# budget, and the 80 newer messages after it were dropped). Reading that one message gets it in full.
+HISTORY_FORWARD_CHARS = 3000
 _CQ = re.compile(r"\[CQ:([a-z_]+)((?:,[^\]]*)?)\]", re.I)
 
 
@@ -84,6 +87,7 @@ class _Reader:
         self.messages_seen = set()
         self.warnings = []
         self.remaining_chars = MAX_TEXT
+        self.forward_cap = 0
 
     def warn(self, text):
         if text not in self.warnings:
@@ -167,6 +171,10 @@ class _Reader:
                                                     api_reader=self.api_reader, diagnostics=info)
                 if info.get('failures') or info.get('truncated'):
                     self.warn('部分合并转发读取失败或达到展开上限')
+                if self.forward_cap and len(value) > self.forward_cap:
+                    value = (value[:self.forward_cap]
+                             + '…[这份转发很长，这里只列出开头；要看全文，引用它再问]')
+                    self.warn('较长的合并转发只列出了开头')
                 parts.append(value)
             elif kind == 'reply':
                 identifier = data.get('id')
@@ -339,12 +347,15 @@ def read_group_chat(api_url, group_id, count=50, before_seq=None, keyword='', se
                     continue
             selected.append(row)
         selected = selected[-amount:]
+        reader.forward_cap = HISTORY_FORWARD_CHARS
         messages = []
-        for row in selected:
+        # Newest first: when the text budget runs out, the oldest messages are the ones left out.
+        for row in reversed(selected):
             if reader.remaining_chars <= 0:
-                reader.warn('正文达到文本上限，后续消息未展开')
+                reader.warn('正文达到文本上限，更早的消息未展开')
                 break
             messages.append(reader.record(row))
+        messages.reverse()
         if info.get('failures'):
             reader.warn('后续历史分页读取失败；当前仅保留成功读取的页面')
         # Continue before the oldest returned message, not before the entire

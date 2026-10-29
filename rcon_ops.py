@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-RCON 反控命令模块（2026-08-16 按 upstream QQConsoleBridge 功能实现）
-- 命令集对齐工具包 QQConsoleBridge：help/list/day/rules/version/uptime/ip/roll/运势/id（全体）
-  + tps/backup/save/seed/weather/say/stop/restart/cmd（群主/管理员）
-- RCON 走 rcon_client（NeoForge 自动适配 neoforge tps）
-"""
+"""RCON commands with deterministic permission checks, confirmation and audit logging."""
 import contextlib
 import os
 import re
@@ -26,10 +21,11 @@ from ops_contract import append_jsonl, command_result
 from server_registry import active_server, query_server, server_context
 from command_catalog import normalize_console_command
 from public_errors import public_failure_label
+from runtime_paths import default_path
 
 # 服务器根目录（Mac 侧）
-SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR", "/Users/goudanli/Downloads/NAST Server1.9.9"))
-ADDR = os.environ.get("MC_SERVER_ADDR", "scex.aerohakugyokurou.top:23323")
+SERVER_DIR = Path(os.environ.get("MC_SERVER_DIR") or default_path("server"))
+ADDR = os.environ.get("MC_SERVER_ADDR", "127.0.0.1:25565")
 
 # 命令权限：普通 vs 管理员
 PUBLIC_CMDS = {"help", "帮助", "list", "在线", "day", "date", "time", "日期", "rules", "规则",
@@ -48,8 +44,9 @@ HIGH_RISK_CMDS = {"stop", "restart", "cmd", "控制台", "确认", "confirm", "�
 TARGETLESS_CMDS = {"help", "帮助", "roll", "运势", "id", "whoami"}
 
 RISK_TTL_SECONDS = 90
-AUDIT_PATH = Path(__file__).with_name("logs") / "ops-audit.jsonl"
-RESULT_PATH = Path(__file__).with_name("logs") / "command-results.jsonl"
+# Offline tests (SCE_BOT_TEST_MODE=1) write under the temp state root, not the live hash chain.
+AUDIT_PATH = Path(os.environ.get("SANAE_OPS_AUDIT") or default_path("logs", "ops-audit.jsonl"))
+RESULT_PATH = Path(os.environ.get("SANAE_COMMAND_RESULTS") or default_path("logs", "command-results.jsonl"))
 _PENDING_RISK = {}
 _RISK_LOCK = threading.Lock()
 _AUDIT_LOCK = threading.Lock()
@@ -273,6 +270,7 @@ def cmd_help(privileged):
         '!周报 / !运行报告 查近7天统计；!周报 详情 / !体检 查统计口径与数据覆盖\n'
         '周报每周一20:00（北京时间）自动发玩家群；包含性能、在线、玩家榜、进服和错误告警。\n'
         '!bug 问题描述 报告服务器或模组问题（群里聊到的问题也会被自动记下）\n'
+        '!绑定 游戏ID 把 QQ 和游戏名绑在一起（要进过服），问“我的数据”时早苗就按它查；!绑定 查看；!解绑 取消\n'
         '\n◆ AI 与共享知识\n'
         '@早苗 问题 进行问答；已保存的相关通用知识会自动用于回答。\n'
         '可回复合并转发后 @早苗 分析一下；或 @早苗 总结最近群聊。\n'
@@ -379,6 +377,25 @@ def cmd_save():
         return f"[存盘] 保存失败：{public_failure_label(e)}"
 
 
+# 1.21 has no command that reports the weather; two read-only predicate tests do (10-26).
+WEATHER_QUERY_ALIASES = frozenset({'weather query', 'weather get', 'weather status', 'weather ?'})
+_WEATHER_TEST = 'execute if predicate {condition:"minecraft:weather_check",%s:true}'
+
+
+def weather_status(run=None):
+    """'主世界现在是晴天/在下雨/雷雨' from live predicate tests; raises when RCON fails."""
+    run = run or _run
+    thundering = 'passed' in str(run(_WEATHER_TEST % 'thundering') or '').lower()
+    raining = thundering or 'passed' in str(run(_WEATHER_TEST % 'raining') or '').lower()
+    state = '雷雨' if thundering else ('在下雨（雪地群系是下雪）' if raining else '晴天')
+    return f'[天气] 主世界现在{"是" if not raining or thundering else ""}{state}（实时查询）'
+
+
+def audit_ai_command(uid, command, result=""):
+    """Audit one low-risk change she ran herself on an admin's request."""
+    _audit("ai_direct", uid, "cmd " + str(command or ""), "low: " + str(result or ""))
+
+
 def cmd_weather(arg):
     target = {"clear": "clear", "晴": "clear", "晴天": "clear",
               "rain": "rain", "雨": "rain", "下雨": "rain", "雨天": "rain",
@@ -428,6 +445,8 @@ def cmd_restart(uid):
 
 
 def _execute_cmd(command):
+    if command.strip().casefold() in WEATHER_QUERY_ALIASES:
+        return "[控制台返回] " + command[:120] + "\n" + weather_status()
     result = _run(command)
     if not result:
         result = "(命令已执行，无返回内容)"

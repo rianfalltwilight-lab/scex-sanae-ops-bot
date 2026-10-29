@@ -430,7 +430,7 @@ def known_players(mirror_root, ops_root):
     return names
 
 
-def advancement_progress(mirror_root, ops_root, player='', query='', limit=10):
+def advancement_progress(mirror_root, ops_root, player='', query='', limit=None, order='recent'):
     index = (_read_json(Path(ops_root) / 'advancement-index.json', {}) or {}).get('advancements') or {}
     if not index:
         return '进度目录还没有建立（每天同步一次），稍后再查。'
@@ -477,6 +477,10 @@ def advancement_progress(mirror_root, ops_root, player='', query='', limit=10):
             f'{i}. {p["name"]}：{len(p["done"])} 个（{len(p["done"]) * 100 // total}%）' for i, p in enumerate(top, 1)]
         if ranked:
             lines.append(f'中位数 {len(ranked[len(ranked) // 2]["done"])} 个。')
+            # 10-28 07:15 "全服玩家最多完成的是哪个成就": she had to query advancements one by one.
+            popular = sorted(counts, key=lambda i: (-counts[i], index[i]['name']))[:10]
+            lines.append('全服完成人数最多的进度：' + '、'.join(
+                f'「{index[i]["name"]}」（{index[i]["mod"]}，{counts[i]} 人）' for i in popular))
         return '\n'.join(lines) + '\n' + note
     person, message = _match(people, player, score=lambda p: len(p['done']))
     if not person:
@@ -485,12 +489,32 @@ def advancement_progress(mirror_root, ops_root, player='', query='', limit=10):
     lines = [f'玩家 {person["name"]} 的进度：', f'- 已完成 {len(done)}/{total} 个（{len(done) * 100 // total}%）']
     by_mod, all_mod = Counter(index[i]['mod'] for i in done), Counter(row['mod'] for row in index.values())
     if by_mod:
-        lines.append('- 按模组（完成最多的）：' + '、'.join(f'{m} {n}/{all_mod[m]}' for m, n in by_mod.most_common(8)))
+        lines.append('- 按模组（完成最多的）：' + '、'.join(f'{m} {n}/{all_mod[m]}（{n * 100 // all_mod[m]}%）'
+                                                for m, n in by_mod.most_common(8)))
+        # 10-28 07:19 asked for the mods with the highest share; tiny mods (1/1) would top any list.
+        share = sorted((m for m in by_mod if all_mod[m] >= 5), key=lambda m: (-by_mod[m] / all_mod[m], m))[:5]
+        if share:
+            lines.append('- 完成比例最高的模组（至少 5 个进度）：' + '、'.join(
+                f'{m} {by_mod[m] * 100 // all_mod[m]}%（{by_mod[m]}/{all_mod[m]}）' for m in share))
     challenges = [i for i in done if index[i]['frame'] == 'challenge']
     lines.append(f'- 其中挑战类 {len(challenges)}/{sum(1 for r in index.values() if r["frame"] == "challenge")} 个')
-    recent = sorted(((t, i) for i, t in done.items() if t), reverse=True)[:5]
+    try:
+        shown = max(1, min(int(limit or 5), 20))
+    except (TypeError, ValueError):
+        shown = 5
+    earliest = str(order or '') == 'earliest'
+    recent = sorted(((t, i) for i, t in done.items() if t), reverse=not earliest)[:shown]
     if recent:
-        lines.append('- 最近完成：' + '、'.join(f'「{index[i]["name"]}」（{index[i]["mod"]}，{_stamp(t)}）' for t, i in recent))
+        lines.append(('- 最早完成：' if earliest else '- 最近完成：')
+                     + '、'.join(f'「{index[i]["name"]}」（{index[i]["mod"]}，{_stamp(t)}）' for t, i in recent))
+    stamps = sorted(t for t in done.values() if t)
+    if stamps:
+        # 10-28 07:20 "我还没开始忙loot，不知道哪儿来的成就": Lootr and many root advancements are
+        # granted on the first join; this player got 10+ of them in the same minute.
+        first = [t for t in stamps if t - stamps[0] <= 60]
+        if len(first) >= 5:
+            lines.append(f'- 第一次进服时（{_stamp(stamps[0])}）一分钟内就得到 {len(first)} 个，'
+                         '多半是各模组进服就自动给的入门进度，不是自己做出来的')
     rare = sorted(done, key=lambda i: (counts.get(i, 0), index[i]['name']))[:3]
     rare = [i for i in rare if counts.get(i, 0) <= 3]
     if rare:

@@ -57,6 +57,38 @@ def lag_step(state, row, threshold=10.0, minutes=5, max_gap=150, repeat=3600):
     return state, None
 
 
+def sustained_step(state, row, threshold=14.0, minutes=20, repeat=3600, max_gap=150):
+    """Average TPS of the last `minutes` of samples below threshold; (state, alert or None).
+    10-28 23:21-01:15 TPS stayed between 7.6 and 14.3 for 114 minutes but never under 10 for five
+    samples in a row, so lag_step stayed quiet while players asked in the group why it was so slow.
+    state['window'] holds [timestamp, tps, mspt]; a failed reading or a gap starts it over."""
+    state = dict(state or {})
+    stamp, tps, mspt = _num(row.get('timestamp')), _num(row.get('tps')), _num(row.get('mspt'))
+    if stamp is None or tps is None or row.get('tick_parser', 2) != 2:
+        state.update(window=[], reported_at=None)
+        return state, None
+    window = [item for item in state.get('window') or [] if isinstance(item, list) and len(item) == 3]
+    if window and stamp - float(window[-1][0]) > max_gap:
+        window = []
+    window.append([stamp, tps, mspt or 0.0])
+    window = [item for item in window if stamp - float(item[0]) <= minutes * 60]
+    state['window'] = window
+    if len(window) < minutes - 2 or stamp - float(window[0][0]) < (minutes - 1) * 60 - 30:
+        return state, None
+    average = sum(item[1] for item in window) / len(window)
+    if average >= threshold:
+        state['reported_at'] = None
+        return state, None
+    reported = state.get('reported_at')
+    if reported is not None and stamp - float(reported) < repeat:
+        return state, None
+    state['reported_at'] = stamp
+    return state, {'kind': 'sustained', 'start': window[0][0], 'last': stamp, 'samples': len(window),
+                   'avg_tps': average, 'min_tps': min(item[1] for item in window),
+                   'avg_mspt': sum(item[2] for item in window) / len(window), 'threshold': threshold,
+                   'minutes': minutes, 'continuing': reported is not None}
+
+
 def dimension_ticks(text):
     """[(dimension, tps, ms_per_tick)] from `neoforge tps`, slowest first, without Overall."""
     rows = []
@@ -69,9 +101,14 @@ def dimension_ticks(text):
 
 def format_lag_alert(prefix, streak, ticks_text='', list_text='', extra_lines=()):
     minutes = max(1, round((streak['last'] - streak['start']) / 60) + 1)
-    lines = [f'{prefix}【卡顿提醒】TPS 已连续约 {minutes} 分钟低于 {streak["threshold"]:g}'
-             + ('，仍在持续' if streak.get('continuing') else '')
-             + f'（{_clock(streak["start"])} 起，最低 {streak["min_tps"]:.1f}，平均 MSPT {streak["avg_mspt"]:.0f}）']
+    if streak.get('kind') == 'sustained':
+        lines = [f'{prefix}【卡顿提醒】最近 {streak["minutes"]} 分钟平均 TPS {streak["avg_tps"]:.1f}，'
+                 f'低于 {streak["threshold"]:g}' + ('，仍在持续' if streak.get('continuing') else '')
+                 + f'（最低 {streak["min_tps"]:.1f}，平均 MSPT {streak["avg_mspt"]:.0f}）']
+    else:
+        lines = [f'{prefix}【卡顿提醒】TPS 已连续约 {minutes} 分钟低于 {streak["threshold"]:g}'
+                 + ('，仍在持续' if streak.get('continuing') else '')
+                 + f'（{_clock(streak["start"])} 起，最低 {streak["min_tps"]:.1f}，平均 MSPT {streak["avg_mspt"]:.0f}）']
     dims = [row for row in dimension_ticks(ticks_text) if row[2] >= 1][:3]
     if dims:
         lines.append('最耗时的维度：' + '、'.join(f'{name} {ms:.0f} ms/tick' for name, _tps, ms in dims))

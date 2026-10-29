@@ -18,6 +18,10 @@ from pathlib import Path
 
 
 _RECIPE_PATH = re.compile(r"^data/([^/]+)/(?:recipes|recipe)/(.+)\.json$", re.I)
+# Schema 2 (10-28): processing recipes that list "results" (Create mixing/pressing/crushing and
+# others) were left out, so "黄铜怎么合成" found only the nugget and block recipes.
+INDEX_SCHEMA = 2
+HEAT_LABELS = {"heated": "heated", "superheated": "superheated"}
 _LANG_PATH = re.compile(r"^assets/([^/]+)/lang/(zh_cn|en_us)\.json$", re.I)
 
 
@@ -68,6 +72,13 @@ def _ingredient(value):
         return ""
     if value.get("tag"):
         return "#" + str(value["tag"])
+    fluid = value.get("fluid") or value.get("fluidTag") or value.get("fluid_tag")
+    if isinstance(fluid, dict):
+        fluid = fluid.get("id") or fluid.get("name") or fluid.get("tag")
+    if isinstance(fluid, str) and fluid:
+        amount = value.get("amount")
+        prefix = "#" if (value.get("fluidTag") or value.get("fluid_tag")) and not fluid.startswith("#") else ""
+        return prefix + fluid + (" %smB" % amount if isinstance(amount, int) else "")
     found = _item_id(value)
     if found:
         return found
@@ -87,6 +98,17 @@ def _parse_recipe(recipe_id, raw, source):
             if key in raw:
                 result_value = raw[key]
                 break
+    outputs = []
+    if result_value is None:
+        listed = raw.get("results") if isinstance(raw.get("results"), list) else raw.get("outputs")
+        if isinstance(listed, list):
+            items = [entry for entry in listed if _item_id(entry)]
+            if items:
+                result_value = items[0]
+                for entry in items[1:6]:
+                    chance = entry.get("chance") if isinstance(entry, dict) else None
+                    outputs.append([_item_id(entry), _count(entry)]
+                                   + ([round(float(chance), 3)] if isinstance(chance, (int, float)) else []))
     result = _item_id(result_value)
     result_count = _count(result_value)
     pattern = raw.get("pattern") if isinstance(raw.get("pattern"), list) else []
@@ -109,11 +131,20 @@ def _parse_recipe(recipe_id, raw, source):
             ingredients.append(item)
     if not result:
         return None
-    return {
+    row = {
         "id": recipe_id, "type": recipe_type, "result": result,
         "count": result_count, "pattern": [str(row)[:9] for row in pattern[:9]],
         "key": key_map, "ingredients": ingredients[:24], "source": source,
     }
+    heat = HEAT_LABELS.get(str(raw.get("heat_requirement") or raw.get("heatRequirement") or "").casefold())
+    if heat:
+        row["heat"] = heat
+    if outputs:
+        row["outputs"] = outputs
+    chance = result_value.get("chance") if isinstance(result_value, dict) else None
+    if isinstance(chance, (int, float)) and chance < 1:
+        row["chance"] = round(float(chance), 3)
+    return row
 
 
 def _merge_lang(target, raw):
@@ -171,10 +202,11 @@ def build_recipe_index(server_dir, server_id="unknown", prefix="[未知服]", ma
                 errors.append("%s: %s" % (source.name, type(exc).__name__))
     item_ids = {row["result"] for row in recipes}
     for row in recipes:
+        item_ids.update(output[0] for output in row.get("outputs", []))
         item_ids.update(value for value in row.get("ingredients", []) if ":" in value and " | " not in value)
         item_ids.update(value for value in row.get("key", {}).values() if ":" in value and " | " not in value)
     return {
-        "schema": 1, "server": server_id, "prefix": prefix,
+        "schema": INDEX_SCHEMA, "server": server_id, "prefix": prefix,
         "generated_at": time.time(), "signature": recipe_signature(root),
         "recipe_count": len(recipes), "source_count": len(sources),
         "truncated": len(recipes) >= max_recipes, "errors": errors,

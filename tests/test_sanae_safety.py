@@ -310,7 +310,8 @@ class SanaeSafetyTests(unittest.TestCase):
     def test_execute_tool_rejects_danger_before_rcon(self):
         with mock.patch.object(s, "rcon_query") as rcon:
             text = s.execute_tool("run_rcon", {"command": "execute as @a run kill @s"}, True, True)
-            self.assertIn("!cmd", text)
+            self.assertIn("需要确认码", text)
+            self.assertIn("request_console_command", text)
             rcon.assert_not_called()
             text = s.execute_tool("run_rcon", {"command": "weather clear"}, True, False)
             self.assertIn("拒绝", text)

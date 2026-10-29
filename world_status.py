@@ -215,6 +215,46 @@ def player_positions(query, list_text):
     return rows
 
 
+def player_locations(query, list_text):
+    """(online names, [(name, dim, x, y, z)]) via `data get entity`; a player whose data fails is left out."""
+    match = re.search(r'players online:?\s*(.*)', str(list_text or ''))
+    names = [n.strip() for n in (match.group(1) if match else '').split(',') if n.strip()]
+    rows = []
+    for name in names[:40]:
+        if not re.fullmatch(r'[A-Za-z0-9_]{1,16}', name):
+            continue
+        try:
+            dim = re.search(r'"([a-z0-9_.-]+:[a-z0-9_./-]+)"', query(f'data get entity {name} Dimension'))
+            pos = re.search(r'\[(-?[\d.]+)d?,\s*(-?[\d.]+)d?,\s*(-?[\d.]+)d?\]', query(f'data get entity {name} Pos'))
+        except Exception:
+            continue
+        if dim and pos:
+            rows.append((name, dim.group(1), *(math.floor(float(pos.group(i))) for i in (1, 2, 3))))
+    return names, rows
+
+
+def format_players(prefix, located, detailed=False):
+    """Which world each online player is in; block coordinates for admins only (PvP is on)."""
+    names, rows = located
+    if not names:
+        return f'{prefix} 现在没有在线玩家（或者在线名单没取到）。'
+    groups = {}
+    for name, dim, *_pos in rows:
+        groups.setdefault(dim, []).append(name)
+    lines = [f'{prefix} 在线 {len(names)} 人，按世界：' + '；'.join(
+        f'{dim_label(dim)} {len(people)} 人（{"、".join(people)}）'
+        for dim, people in sorted(groups.items(), key=lambda kv: -len(kv[1])))]
+    missing = [n for n in names if n not in {row[0] for row in rows}]
+    if missing:
+        lines.append('位置没取到：' + '、'.join(missing))
+    if detailed and rows:
+        lines.append('坐标（只给管理员）：' + '；'.join(f'{name} {dim_label(dim)} x={x} y={y} z={z}'
+                                                 for name, dim, x, y, z in rows))
+    elif rows:
+        lines.append('具体坐标没有列出（只给管理员，而且要明确问坐标才给）。')
+    return '\n'.join(lines)
+
+
 def simulation_distance(properties_path, default=10):
     try:
         text = Path(properties_path).read_text(encoding='utf-8', errors='replace')
@@ -353,6 +393,14 @@ def servercore_line(core):
     return 'ServerCore 当前设置：' + '、'.join(parts)
 
 
+def _chunk_block(label):
+    """'（方块约 x=-15000 z=12808）' for a chunk label like '-938, 800'; '' if not understood."""
+    values = re.findall(r'-?\d+', str(label or ''))
+    if len(values) < 2:
+        return ''
+    return f'（方块约 x={int(values[0]) * 16 + 8} z={int(values[1]) * 16 + 8}）'
+
+
 def format_entities(prefix, total_text, filtered_text='', entity='', detailed=False, top=15, limiter_text=''):
     total, rows = parse_entity_list(total_text)
     if total is None:
@@ -365,7 +413,9 @@ def format_entities(prefix, total_text, filtered_text='', entity='', detailed=Fa
             lines.append(f'{entity_label(entity)}：查不到这个实体类型，名字要写完整 ID。')
         else:
             if detailed:
-                spots = '、'.join(f'区块 ({label}) {count} 个' for count, label in chunks[:10])
+                # Block coordinates too: 10-27 00:46 she offered to "get more precise coordinates"
+                # from the admins, to the owner himself.
+                spots = '、'.join(f'区块 ({label}){_chunk_block(label)} {count} 个' for count, label in chunks[:10])
             else:
                 spots = '、'.join(str(count) for count, _label in chunks[:10]) + '（坐标只对管理员显示）'
             lines.append(f'{entity_label(entity)} 共 {sub_total} 个，最集中的区块：{spots}')
@@ -425,11 +475,21 @@ def format_lag(prefix, tps_text, perf_text, entities_text, block_text='', server
     return '\n'.join(lines)
 
 
+# Block entity types whose block (and so its name) has another ID.
+BLOCK_ENTITY_BLOCKS = {'minecraft:mob_spawner': 'minecraft:spawner'}
+
+
+def _block_entry(block_id, names):
+    names = names or {}
+    entry = names.get(block_id) or names.get(BLOCK_ENTITY_BLOCKS.get(block_id, '')) or {}
+    return entry if isinstance(entry, dict) else {}
+
+
 def block_label(block_id, names=None):
     """Block entity type with its block name when the item index knows it."""
     if block_id == '<lithium_sleeping>':
         return '休眠中的方块实体（Lithium 已暂停，几乎不耗算力）'
-    entry = (names or {}).get(block_id) or {}
+    entry = _block_entry(block_id, names)
     label = (entry.get('zh') or entry.get('en')) if isinstance(entry, dict) else ''
     label = str(label or '').replace('<MISSING>', '').strip()      # untranslated part of a mod's name
     return f'{label}（{block_id}）' if label else block_id
@@ -450,6 +510,77 @@ def format_machines(prefix, by_type, by_type_more='', by_player='', entities_by_
     if entities:
         lines.append('实体按在线玩家：' + '、'.join(f'{name} {count}' for name, count in entities[:10]))
     lines.append('数字是此刻的瞬时值，只含加载中的区块；不在线玩家的基地如果没被强加载，不计入。')
+    return '\n'.join(lines)
+
+
+def scan_statistics(query, command='statistics block-entities byType', max_pages=80, passes=2):
+    """Every page of a ServerCore statistics listing (8 rows a page; 53 pages on 10-29, ~0.1 s each).
+    Equal counts come back in a different order on every call, so a type tied across a page boundary
+    can fall out of one pass (3 passes on 10-29 each missed 4-6 of ~420 types, the water wheel once);
+    the passes are merged. {'rows': [(label, count)] by rank, 'read', 'total', 'complete'}"""
+    seen, last = {}, None
+    for _ in range(max(1, passes)):
+        last = _scan_pages(query, command, max_pages)
+        for rank, (label, count) in enumerate(last['rows']):
+            if label not in seen or rank < seen[label][0]:
+                seen[label] = (rank, count)
+    rows = [(label, count) for label, (_rank, count) in sorted(seen.items(), key=lambda kv: kv[1][0])]
+    return dict(last, rows=rows)
+
+
+def _scan_pages(query, command, max_pages):
+    rows, total, read = [], None, 0
+    for page in range(1, max_pages + 1):
+        try:
+            text = str(query(f'{command} {page}') or '')
+        except Exception:
+            if page == 1:
+                raise
+            break
+        if page > 1 and re.search(r"Page doesn.t exist", text, re.I):
+            return {'rows': rows, 'read': read, 'total': total or read, 'complete': True}
+        found = parse_statistics(text)
+        if found is None:
+            break
+        rows += found
+        read = page
+        match = re.search(r'Page\s+\d+\s+of\s+(\d+)', text)
+        total = int(match.group(1)) if match else total
+        if not found or (total and page >= total):
+            return {'rows': rows, 'read': read, 'total': total or read, 'complete': True}
+    return {'rows': rows, 'read': read, 'total': total, 'complete': False}
+
+
+def format_block_count(prefix, needle, scan, names=None, top=12):
+    """How many of one kind of block entity tick right now (10-29 01:11 "服务器有多少在运行的水车和大型
+    水车": the 16-row top list could only say "fewer than 200")."""
+    wanted = re.sub(r'\s+', ' ', str(needle or '')).strip().casefold()
+    rows = scan.get('rows') or []
+    if not rows:
+        return f'{prefix} 方块实体统计暂时取不到（ServerCore statistics 没有返回）。'
+    hits = []
+    for rank, (label, count) in enumerate(rows, 1):
+        if label == '<lithium_sleeping>':
+            continue
+        entry = _block_entry(label, names)
+        values = (label.casefold(), str(entry.get('zh') or '').casefold(), str(entry.get('en') or '').casefold())
+        if wanted and any(wanted in value for value in values if value):
+            hits.append((rank, label, count))
+    if scan.get('complete'):
+        scope = f'翻完了全部 {scan.get("total") or scan.get("read")} 页、{len(rows)} 种'
+    else:
+        scope = (f'只翻到第 {scan.get("read")} 页' + (f'（共 {scan["total"]} 页）' if scan.get('total') else '')
+                 + '，后面数量更少的没看到')
+    if hits:
+        lines = [f'{prefix} 此刻正在运算的「{needle}」（{scope}）：' + '、'.join(
+            f'{block_label(label, names)} {count} 个（第 {rank} 名）' for rank, label, count in hits[:top])
+            + (f' 等 {len(hits)} 种' if len(hits) > top else '')]
+    else:
+        lines = [f'{prefix} 已加载的区块里没有正在运算的「{needle}」（{scope}）。'
+                 '名字可能和游戏里不一样，可以换成方块 ID 再查，例如 create:water_wheel。']
+    sleeping = next((count for label, count in rows if label == '<lithium_sleeping>'), None)
+    lines.append('只算此刻已加载、每刻都在处理的方块；没人在附近又没被强加载的区块里的不算。'
+                 + (f'Lithium 暂停的休眠方块实体（此刻 {sleeping} 个）不分种类，不在上面的数里。' if sleeping else ''))
     return '\n'.join(lines)
 
 
@@ -523,7 +654,7 @@ def format_host(prefix, host, now=None):
 
 
 def lag_alert_lines(entities_text, perf_text, item_text='', orb_text='', block_text='', servercore_text='',
-                    host=None, tick_text=''):
+                    host=None, tick_text='', entities_by_player='', blocks_by_player=''):
     """Extra lines for the admin-group lag alert (coordinates allowed there)."""
     lines = []
     tick = parse_tick_query(tick_text)
@@ -547,6 +678,11 @@ def lag_alert_lines(entities_text, perf_text, item_text='', orb_text='', block_t
     blocks = parse_statistics(block_text)
     if blocks:
         lines.append('运算中的方块实体：' + '、'.join(f'{label} {count}' for label, count in blocks[:4]))
+    # 10-29 00:30 the End's 1211 entities around one player's mob farm were most of the lag.
+    for label, text in (('实体最多的玩家周围', entities_by_player), ('方块实体最多的玩家周围', blocks_by_player)):
+        rows = parse_statistics(text)
+        if rows:
+            lines.append(f'{label}：' + '、'.join(f'{name} {count}' for name, count in rows[:5]))
     core = parse_servercore(servercore_text)
     if core:
         lines.append(servercore_line(core))

@@ -119,6 +119,7 @@ import mod_lookup as _mod_lookup
 from public_errors import public_failure_label
 from runtime_paths import default_path as _default_path
 import fun_mute as _fun
+import qq_interact as _qq_interact
 import bug_reports as _bugs
 _mod_lookup.set_zhipu_key(_require_secret('zhipu_api_key'))
 _mod_lookup.set_cf_api_key(_require_secret('curseforge_api_key'))
@@ -143,7 +144,10 @@ from functools import wraps
 import rcon_ops as _rcon_ops
 import command_catalog as _command_catalog
 import server_insight as _server_insight
-from player_bindings import PlayerBindings
+from player_bindings import PlayerBindings, known_names as _known_player_names
+from server_registry import parse_player_list as _parse_player_list
+import player_trail as _player_trail
+import sanae_local_ops as _sanae_local_ops
 from media_segments import media_segments, media_urls
 from media_ai import image_host_upload, _download, analyze_media as _analyze_media, media_fingerprints
 from request_runtime import Budget, bounded_call, RequestTimeout, RequestBusy
@@ -489,6 +493,64 @@ def _fun_bot_can_mute(gid):
     return cached[0] in {'owner', 'admin'}
 
 
+# QQ group actions the model may take (round 29): checked against live QQ roles in qq_interact.
+QQ_INTERACT = _qq_interact.QQInteract(QQ_ACTIONS, WIKI_BOT_QQ,
+                                      audit_path=_default_path('state', 'qq-actions-audit.jsonl'))
+_sanae_ai.QQ_INTERACT = QQ_INTERACT
+# Group album photos are described for her on request (round 32).
+QQ_INTERACT.describe = _sanae_ai.describe_images
+POKE_CONTEXT = ('〖事件〗对方刚在群里用 QQ 的“戳一戳”戳了你，没有说话。用一两句自然、简短的话回应，'
+                '可以小小吐槽或者问问有什么事；不要说“收到”，不要提自己是 AI，不要输出贴纸 ID。')
+
+
+def _poke_reaction(gid, uid, decision):
+    """Answer a poke once with a line, after that poke back (limits in qq_interact.on_poke)."""
+    if _fun_recently_muted(gid, uid):
+        return
+    token = REPLY_GROUP.set(gid)
+    try:
+        if decision == 'reply':
+            try:
+                nick = _qq_interact.name_of(QQ_ACTIONS.member_info(gid, uid))
+            except Exception:
+                nick = ''
+            reply = _sanae_ai.sanae_reply('（戳了戳你）', uid, nick, privileged=False, group_id=gid, force=True,
+                                          social_only=True, include_usage_footer=False,
+                                          explicit_interaction=True, context_reference=POKE_CONTEXT)
+            if reply and reply.strip().upper() != '[SILENT]':
+                if send_group_msg(strip_reply_period(f'[CQ:at,qq={uid}] {reply}'), api=WIKI_API):
+                    try:
+                        SOCIAL_LITE.record_outgoing(gid, f'（被戳后回应）{reply}', action='poke-reply',
+                                                    reply_to_user_id=uid)
+                    except Exception:
+                        pass
+                return
+        QQ_ACTIONS.poke(uid, gid)
+    except Exception as exc:
+        print(f'[poke] reaction failed: {type(exc).__name__}', flush=True)
+    finally:
+        REPLY_GROUP.reset(token)
+
+
+def _handle_notify(event):
+    """QQ notify events: pokes at her in enabled groups, likes on her profile card."""
+    sub = str(event.get('sub_type') or '')
+    if sub == 'poke':
+        gid = event.get('group_id')
+        uid, target = str(event.get('user_id') or ''), str(event.get('target_id') or '')
+        if not gid or not _bridge_group_enabled(gid) or target != str(WIKI_BOT_QQ):
+            return
+        decision = QQ_INTERACT.on_poke(int(gid), uid, target)
+        print(f'[poke] group={gid} user={uid} decision={decision}', flush=True)
+        if decision:
+            # A reply is a model call and waits in the AI pool; a poke back is a quick OneBot call.
+            (_start_ai_worker if decision == 'reply' else _start_worker)(_poke_reaction, args=(int(gid), uid, decision))
+    elif sub == 'profile_like':
+        operator = str(event.get('operator_id') or '')
+        print(f'[profile-like] from={operator} times={event.get("times")}', flush=True)
+        _start_worker(QQ_INTERACT.on_profile_like, args=(operator,))
+
+
 # Private messages to the bot were forwarded to every owner; one owner is not a
 # friend of the bot, so half of those sends always failed. Off in production.
 PRIVATE_FORWARD_ENABLED = _os.environ.get('SANAE_PRIVATE_FORWARD', '1') == '1'
@@ -681,6 +743,21 @@ if FUN_MUTE_AI_ENABLED:
 BUG_REPORT_GROUPS = _group_ids(_os.environ.get('BUG_REPORT_GROUPS', ''), 0) - {0}
 BUG_DIGEST_GROUPS = _group_ids(_os.environ.get('BUG_DIGEST_GROUPS', ''), 0) - {0}
 BUG_DIGEST_HOUR = int(_os.environ.get('BUG_DIGEST_HOUR', '21'))
+
+
+def _notify_admin_groups(text):
+    """notify_admins: one message to each admin group (the bug digest groups)."""
+    ok = False
+    for admin_gid in sorted(BUG_DIGEST_GROUPS):
+        token = REPLY_GROUP.set(admin_gid)
+        try:
+            ok = bool(send_group_msg(text, api=WIKI_API)) or ok
+        finally:
+            REPLY_GROUP.reset(token)
+    return ok
+
+
+_sanae_ai.ADMIN_NOTIFY_FN = _notify_admin_groups if BUG_DIGEST_GROUPS else None
 BUG_LEDGER = _bugs.BugLedger(
     _os.environ.get('BUG_REPORTS_PATH') or _default_path('state', 'bug-reports.json'),
     inventory_path=_os.path.join(str(OPS_STATE_BASE), 'legacy', 'mod-inventory.json'),
@@ -844,6 +921,22 @@ def _nast_ops_sync_loop():
 PLAYER_BINDINGS_ENABLED = _os.environ.get('PLAYER_BINDINGS_ENABLED', '') == '1'
 PLAYER_BINDINGS = PlayerBindings(_os.environ.get(
     'PLAYER_BINDINGS_PATH', _default_path('logs', 'qq-player-binds.json')))
+# Round 30: a bound game name is who "我" is in her answers, and a target name for QQ actions.
+PLAYER_BINDINGS_SERVER = _os.environ.get('PLAYER_BINDINGS_SERVER', 'legacy')
+if PLAYER_BINDINGS_ENABLED:
+    _sanae_ai.PLAYER_NAME_FN = lambda uid: (PLAYER_BINDINGS.get_qq(uid) or {}).get('name', '')
+    QQ_INTERACT.bindings = PLAYER_BINDINGS
+
+
+def _binding_known_names():
+    online = ()
+    server = resolve_server(PLAYER_BINDINGS_SERVER)
+    if server:
+        try:
+            online = (_parse_player_list(query_server(server, 'list')) or {}).get('players') or ()
+        except Exception:
+            online = ()
+    return _known_player_names(_os.path.join(str(OPS_STATE_BASE), PLAYER_BINDINGS_SERVER), online)
 CHAT_RELAY_STATE = _default_path('logs', 'qq-chat-relay.json')
 _CHAT_RELAY_LOCK = threading.Lock()
 
@@ -984,12 +1077,15 @@ def _ai_operation_target(raw, group_id, user_id):
     explicit, cleaned = extract_natural_server_selector(raw)
     if explicit:
         return explicit, cleaned, True
+    # 10-26 22:20: with the group default resolved first, a lone server never counted as
+    # unambiguous, so request_console_command refused natural requests in that group.
+    single = len(list_servers()) == 1
     selected, _error = get_selected(group_id, user_id)
     if selected:
-        return selected, raw, False
+        return selected, raw, single
     default, _default_error = get_group_default(group_id)
     if default:
-        return default, raw, False
+        return default, raw, single
     enabled = list_servers()
     if len(enabled) == 1 and _single_server_fallback_allowed(group_id):
         return enabled[0], raw, True
@@ -1097,23 +1193,73 @@ def _pending_natural_operation_reply(raw, user_id, privileged):
     return bool(_rcon_ops.pending_confirmation(str(user_id)))
 
 
-def _natural_server_operation_candidate(raw, privileged, direct_call=False, at_call=False):
+def _natural_server_operation_candidate(raw, privileged, direct_call=False, at_call=False,
+                                        group_id=None, user_id=''):
     """A server topic is not a request to the bot, even when an admin says it."""
     if not (direct_call or at_call):
         return False
-    if _sanae_ai._has_server_query_intent(raw):
+    if _sanae_ai._has_server_query_intent(raw) or _sanae_ai._asks_to_notify_admins(raw):
         return True
-    return bool(privileged and _sanae_ai._has_console_command_intent(raw))
+    # 10-27 00:23 a follow-up by name ("早苗，把上述……丢给管理员") went to tool-free chat, which
+    # then said "上面没有分析过坐标呀".
+    if group_id is not None and _sanae_ai._server_followup(group_id, user_id, raw):
+        return True
+    return bool(privileged and _sanae_ai._has_operation_request(raw))
 
 
-def _is_ai_operation_turn(raw, privileged):
+def _is_ai_operation_turn(raw, privileged, user_id=''):
     """运维意图必须只使用当前消息，不能混入社交记忆和风格提示。"""
     return bool(
-        _sanae_ai._has_server_query_intent(raw) or
+        _sanae_ai._has_server_query_intent(raw) or _sanae_ai._asks_to_notify_admins(raw) or
         (privileged and (
-            _sanae_ai._has_console_command_intent(raw) or
-            _sanae_ai._has_confirmation_intent(raw) or
-            _sanae_ai._has_cancellation_intent(raw))))
+            _sanae_ai._has_operation_request(raw) or
+            ((_sanae_ai._has_confirmation_intent(raw) or _sanae_ai._has_cancellation_intent(raw))
+             and _sanae_ai._has_pending_operation(user_id)))))
+
+
+# "确认" / "取消" alone, as she asks for after a confirmation request.
+_SHORT_OPERATION_REPLY = re.compile(
+    r'^(?:好的?[，,\s]*)?(?:确认|确定|确认执行|执行|执行吧|批准|就这么做|可以执行|动手|'
+    r'取消|取消吧|算了|算了吧|别执行|不要执行|不用了)[。！!~～\s]*$')
+
+
+def _short_operation_reply(raw):
+    text = _normalize(raw)
+    text = re.sub(r'^@?' + BOT_NAME_PATTERN + r'[\s，,：:]*', '', text, flags=re.I).strip()
+    return bool(_SHORT_OPERATION_REPLY.match(text))
+
+
+def _pending_operation_reply_thread(event):
+    """Confirm or cancel the caller's own pending command without a model call.
+
+    The 90-second window is short and the relay can be slow or fail; a plain "确认" needs no
+    reasoning. The code, the owner check and the server check stay in rcon_ops.
+    """
+    uid = str(event.get('user_id') or '')
+    gid = event.get('group_id', LLBOT_GROUP)
+    sender = event.get('sender') or {}
+    nick = str(sender.get('card') or sender.get('nickname') or uid)
+    raw = str(event.get('raw_message') or '')
+    if uid not in OWNERS and uid not in ADMINS:
+        return
+    pending = _rcon_ops.pending_confirmation(uid)
+    if not pending:
+        send_group_msg(f'[CQ:at,qq={uid}] 刚才那条已经过了 90 秒，没有执行；要做的话再说一次吧', api=WIKI_API)
+        return
+    target = pending.get('server')
+    if _sanae_ai._has_cancellation_intent(raw):
+        action = 'cancel'
+        reply = _rcon_ops.dispatch('取消确认', nick, uid, True)
+    elif not target:
+        action = 'refused'
+        reply = '待确认命令缺少服务器目标，已拒绝执行。'
+    else:
+        action = 'confirm'
+        reply = _rcon_ops.dispatch('确认 ' + pending['code'], nick, uid, True,
+                                   query_fn=_server_query_backend(target), server=target)
+    prefix = f'{server_prefix(target)} ' if target else ''
+    send_group_msg(strip_reply_period(f'[CQ:at,qq={uid}] {prefix}{reply}'), api=WIKI_API)
+    print(f'[rcon] 自然确认: user={uid} group={gid} action={action} label={pending.get("label", "")[:60]}', flush=True)
 
 # ===== MC 百科查询（!wiki/!百科 → mcmod.cn）=====
 _WIKI_PATTERNS = [
@@ -1160,6 +1306,10 @@ def _fetch_wiki(keyword):
     except Exception as e:
         print(f'[wiki] 抓取失败: {e}', flush=True)
         return None
+
+
+# mod_info (round 30) asks MC 百科 through the same search as !wiki.
+_sanae_local_ops.WIKI_FETCH = _fetch_wiki
 
 
 def _wiki_mod_candidates(keyword, title):
@@ -1244,9 +1394,26 @@ def _binding_command(raw, uid, privileged):
     if body == '绑定列表' and privileged:
         rows = PLAYER_BINDINGS.list()
         return '绑定列表：\n' + '\n'.join(f'{row["qq"]} → {row["name"]}' for row in rows) if rows else '暂无绑定。'
+    other = re.fullmatch(r'解绑\s+([A-Za-z0-9_]{1,16})', body)
+    if other:
+        if not privileged:
+            return '只有管理员能解除别人的绑定；解绑自己的发 !解绑。'
+        item = PLAYER_BINDINGS.get_name(other.group(1))
+        if not item:
+            return f'{other.group(1)} 没有被任何 QQ 绑定。'
+        PLAYER_BINDINGS.unbind(item['qq'])
+        return f'已解除 {item["name"]} 和 QQ {item["qq"]} 的绑定。'
     match = re.fullmatch(r'绑定\s+([A-Za-z0-9_]{1,16})', body)
     if match:
-        return PLAYER_BINDINGS.bind(uid, match.group(1))[1]
+        known = _binding_known_names()
+        if not known:
+            return '现在读不到服务器的登录记录，核对不了这个游戏 ID，稍后再绑。'
+        real = known.get(match.group(1).casefold())
+        if not real:
+            return (f'服务器的登录记录里没有 {match.group(1)}。名字要和游戏里一模一样；'
+                    '新玩家先进一次服再绑定。')
+        ok, message = PLAYER_BINDINGS.bind(uid, real)
+        return message + ('之后问“我的游戏时长”“我的研究进度”这类问题时，我就按这个名字查。' if ok else '')
     return None
 
 
@@ -1347,7 +1514,8 @@ def _ai_reply_trigger(event):
     if SANAE_MENTION_ONLY:
         return ''
     direct = _event_direct_name_call(event)
-    if direct and _natural_server_operation_candidate(raw, privileged, direct_call=True):
+    if direct and _natural_server_operation_candidate(raw, privileged, direct_call=True,
+                                                      group_id=event.get('group_id'), user_id=uid):
         return 'direct-name-operation'
     if direct and _sanae_ai.chat_recall.is_recall(raw):
         return 'direct-name-recall'
@@ -1378,7 +1546,7 @@ def _coalescible_chat(event):
     uid = str(event.get('user_id') or '')
     privileged = uid in OWNERS or uid in ADMINS
     if (not text or len(text) > 600 or re.match(r'^[!！/]', text)
-            or _is_ai_operation_turn(raw, privileged)
+            or _is_ai_operation_turn(raw, privileged, uid)
             or _sanae_ai.chat_recall.is_recall(raw)
             or media_segments(event, ('image', 'record', 'audio', 'video', 'file', 'forward'))):
         return False
@@ -1715,6 +1883,66 @@ def _send_social_answer(event, raw, body, reply, group_id, *, prefix='', learn=F
     return True
 
 
+# Questions she is still answering, per group (round 31). 10-28 07:36, 54 s into a 79 s answer:
+# "糟糕给早苗问宕机了" got a chat reply "刚才没看见你叫我，要问什么再跟我说一遍吧".
+_AI_PENDING = {}
+_AI_PENDING_LOCK = threading.Lock()
+
+
+# The newest AI turn per (group, person): a bare "@早苗" followed by the real question a few seconds
+# later gets one answer, not two (10-28 17:50/17:51: two long reports on the same freeze).
+_AI_LATEST = {}
+
+
+def _bare_call(raw):
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(raw or ''))
+    text = re.sub(BOT_NAME_PATTERN, '', text, flags=re.I)
+    return not re.sub(r'[\s，,。.!！?？~～、：:]+', '', text)
+
+
+def _superseded_bare_call(event):
+    """True when this turn was only a call of her name and the same person has asked something since."""
+    if not _bare_call(event.get('raw_message')):
+        return False
+    with _AI_PENDING_LOCK:
+        latest = _AI_LATEST.get((str(event.get('group_id')), str(event.get('user_id'))))
+    return bool(latest and latest != str(event.get('message_id')))
+
+
+def _ai_pending_start(event):
+    with _AI_PENDING_LOCK:
+        _AI_LATEST[(str(event.get('group_id')), str(event.get('user_id')))] = str(event.get('message_id'))
+        if len(_AI_LATEST) > 500:
+            _AI_LATEST.pop(next(iter(_AI_LATEST)))
+    sender = event.get('sender') or {}
+    text = re.sub(r'\[CQ:[^\]]*\]', '', str(event.get('raw_message') or '')).strip()
+    row = {'user_id': str(event.get('user_id') or ''), 'name': str(sender.get('card') or sender.get('nickname') or '')[:24],
+           'text': text[:80], 'started': time.time()}
+    with _AI_PENDING_LOCK:
+        _AI_PENDING.setdefault(str(event.get('group_id')), {})[str(event.get('message_id'))] = row
+
+
+def _ai_pending_done(event):
+    with _AI_PENDING_LOCK:
+        rows = _AI_PENDING.get(str(event.get('group_id'))) or {}
+        rows.pop(str(event.get('message_id')), None)
+
+
+def _ai_pending_note(group_id, exclude_message_id=None, now=None):
+    """What she is still working on, for a chat reply in the same group; '' when nothing is."""
+    now = time.time() if now is None else now
+    with _AI_PENDING_LOCK:
+        rows = [row for key, row in (_AI_PENDING.get(str(group_id)) or {}).items()
+                if key != str(exclude_message_id) and now - row['started'] < 300]
+    if not rows:
+        return ''
+    asks = '；'.join(f'{row["name"] or "QQ " + row["user_id"]}（QQ {row["user_id"]}）{int(now - row["started"])} 秒前问的'
+                    f'“{row["text"]}”' for row in rows[:3])
+    return ('〖你手上正在处理的问题〗' + asks + '。这个问题你已经在另一条回复里查着（不是这一轮），'
+            '查好会自动发出来，不用对方再叫你；这是“做不到等会儿再告诉你”那条的例外。'
+            '有人说你宕机、卡住、没反应时，就说还在查那个问题、马上好；不要说没看见、没叫你，也不要让对方再问一次。')
+
+
 def _commit_social_outgoing(event, text):
     """Commit local history only while this reply's sources are still live."""
     source_ids = list(event.get('_conversation_source_ids') or [event.get('message_id')])
@@ -1902,6 +2130,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 print(f'[conversation-memory] recall failed: {type(exc).__name__}', flush=True)
             return
 
+        if event.get('post_type') == 'notice' and event.get('notice_type') == 'notify':
+            try:
+                _handle_notify(event)
+            except Exception as exc:
+                print(f'[notify] failed: {type(exc).__name__}', flush=True)
+            return
+
         # Shop queries stay scoped to their configured groups and explicit mentions.
         if _shop_query.is_query(event):
             _start_worker(_shop_query.reply, args=(event,))
@@ -1941,7 +2176,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     _pending_natural_operation_reply(raw, uid, privileged))
                 natural_operation_candidate = _natural_server_operation_candidate(
                     raw, privileged,
-                    direct_name_candidate and not SANAE_MENTION_ONLY, at_candidate)
+                    direct_name_candidate and not SANAE_MENTION_ONLY, at_candidate,
+                    group_id=gid, user_id=uid)
                 # The AI judge sees every text message, duplicates included,
                 # before any routing below can return early.
                 _fun_mute_observe(event, raw, at_candidate or direct_name_candidate)
@@ -2015,7 +2251,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         _start_worker(lambda: send_group_msg('这次记忆操作没有完成，请稍后再试。', api=WIKI_API))
                         return
 
-                if not _is_ai_operation_turn(raw, privileged):
+                if not _is_ai_operation_turn(raw, privileged, uid):
                     try:
                         REPLY_LESSONS.observe(event, directed=(at_candidate or direct_name_candidate))
                         lesson_batch = REPLY_LESSONS.prepare_batch(gid)
@@ -2033,7 +2269,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     except Exception as exc:
                         print(f'[conversation-memory] observe failed: {type(exc).__name__}', flush=True)
 
-                if EXPRESSION_LEARNING_ENABLED and not _is_ai_operation_turn(raw, privileged):
+                if EXPRESSION_LEARNING_ENABLED and not _is_ai_operation_turn(raw, privileged, uid):
                     try:
                         if EXPRESSION_MEMORY.observe(event):
                             expression_batch = EXPRESSION_MEMORY.prepare_batch(gid)
@@ -2225,6 +2461,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # OneBot 的真实 at 段；自然点名和普通群聊不再唤醒模型。
                 direct_name_call = direct_name_candidate
                 if pending_operation_candidate:
+                    if _short_operation_reply(raw):
+                        _start_worker(_pending_operation_reply_thread, args=(event,))
+                        print(f"[sanae] 待确认操作直接处理: user={uid}", flush=True)
+                        return
                     _queue_sanae_reply(self._sanae_reply_thread, event, True)
                     print(f"[sanae] 待确认操作自然回复: user={uid}", flush=True)
                     return
@@ -2344,6 +2584,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             print('[sanae-route] channel=ai blocked=no-invocation message_id={} user={}'.format(
                 event.get('message_id', ''), event.get('user_id', '')), flush=True)
             return
+        _ai_pending_start(event)
         try:
             raw = str(event.get('raw_message', ''))
             uid = event.get('user_id')
@@ -2361,12 +2602,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
             selected_server, raw, target_unambiguous = _ai_operation_target(raw, gid, uid)
             chat_requested = (trigger in {'mention-self', 'direct-name'}
-                              and not _is_ai_operation_turn(raw, privileged))
+                              and not _is_ai_operation_turn(raw, privileged, uid))
             context_reference = ''
             social_style_override = ''
             # 运维工具的意图识别必须基于干净的当前消息。把长期记忆或
             # 风格策略拼进来，会让其中的“解释/说明”等词误关掉 run_rcon。
-            if gid == SOCIAL_LITE_GROUP and not _is_ai_operation_turn(raw, privileged):
+            if gid == SOCIAL_LITE_GROUP and not _is_ai_operation_turn(raw, privileged, uid):
                 social_style_override = FEEDBACK_STORE.style_override(uid, group_id=gid)
                 extras = ['\n〖回复策略〗' + FEEDBACK_STORE.strategy_hint(uid, group_id=gid)]
                 try:
@@ -2392,7 +2633,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     context_reference='\n'.join(extras),
                     has_images=bool(media_urls(event, kinds=('image',))),
                     selected_server=selected_server, privileged=privileged,
-                    explicit_server=target_unambiguous)
+                    explicit_server=target_unambiguous, user_id=uid)
                 lesson = (_lesson_context(gid, uid, raw, social_style_override)
                           if profile['tier'] == 'chat' or social_style_override else '')
                 if lesson:
@@ -2426,6 +2667,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if reply and _fun_recently_muted(gid, uid):
                 print(f'[sanae] 已被玩笑禁言，不回复: user={uid}', flush=True)
                 return
+            if reply and _superseded_bare_call(event):
+                print(f'[sanae] 只叫了名字、之后又问了新问题，这条不发: user={uid} '
+                      f"message_id={event.get('message_id', '')}", flush=True)
+                return
             if reply and _reply_current(event):
                 msg = strip_reply_period(f'[CQ:at,qq={uid}] {reply}')
                 body = reply_metadata.get('reply_body', reply)
@@ -2445,6 +2690,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         ok = _reply_current(event) and _send_ai_text(msg, gid)
                         if attached:
                             sticker['delivered'] = bool(ok)
+                if ok:
+                    # Her chat replies only knew what chat replies had said (10-27 20:21: right after
+                    # her server-status answer, "给早苗干宕机了" got "你只丢了个聊天记录又没叫我").
+                    try:
+                        _commit_social_outgoing(event, reply.strip())
+                    except Exception as exc:
+                        print(f'[social-lite] answer save failed: {type(exc).__name__}', flush=True)
                 print(f"[sanae] AI回复: trigger={trigger} message_id={event.get('message_id', '')} "
                       f"user={uid} ok={ok} len={len(reply)} elapsed={time.monotonic() - started:.1f}s "
                       f"fallback={int(bool(reply_metadata.get('text_fallback')))} "
@@ -2460,6 +2712,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 send_group_msg(f'[CQ:at,qq={event.get("user_id")}] 嗯？好像有点卡，稍等一下再问我~', api=WIKI_API)
             except Exception:
                 pass
+        finally:
+            _ai_pending_done(event)
 
     @_reply_scope
     def _social_reply_thread(self, event, context):
@@ -2485,6 +2739,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             server_status = _social_server_status(gid, raw)
             if server_status:
                 prompt += '\n\n' + server_status
+            pending_note = _ai_pending_note(gid, event.get('message_id'))
+            if pending_note:
+                prompt += '\n\n' + pending_note
             try:
                 personal_context = CONVERSATION_MEMORY.context(gid, uid, raw,
                     message_id=event.get('message_id'))
@@ -2710,6 +2967,13 @@ if __name__ == '__main__':
         _backup_watch.start()
     if _os.environ.get('SANAE_ENABLE_NAST_SYNC', '1') == '1':
         threading.Thread(target=_nast_ops_sync_loop, name='nast-ops-sync', daemon=True).start()
+    if _os.environ.get('PLAYER_TRAIL_ENABLED', '0') == '1':
+        # Owner decision 10-27: online players' positions every 2 minutes, kept 24 hours, admins only.
+        _trail_server = resolve_server(_os.environ.get('PLAYER_TRAIL_SERVER', 'legacy'))
+        if _trail_server:
+            threading.Thread(target=_player_trail.sampler_loop, name='player-trail', daemon=True, args=(
+                _trail_server, lambda command, server=_trail_server: query_server(server, command),
+                _os.path.join(str(OPS_STATE_BASE), _trail_server['id'], _player_trail.FILE_NAME))).start()
     if _os.environ.get('SANAE_ENABLE_LEGACY_MONITOR', '0') == '1':
         # Keep the Windows production deployment single-process: the existing
         # monitor relays player chat and join/advancement/crash/ops events

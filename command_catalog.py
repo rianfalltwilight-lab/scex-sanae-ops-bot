@@ -69,6 +69,12 @@ def normalize_console_command(command):
 # needs a one-time confirmation code. The model may ask to confirm more, never less.
 _READ_COMMANDS = tuple(re.compile(pattern + r'$', re.I) for pattern in (
     r'list(?: uuids)?', r'help(?: .+)?', r'seed', r'difficulty', r'gamerule [A-Za-z0-9_]+',
+    # Answered by predicate tests in rcon_ops.weather_status, never sent as typed.
+    r'weather (?:query|get|status)',
+    # SI 0.1.10.29 audit subcommands that only read (bounty post/cancel and reactor audit clear do not).
+    r'mio_icif market (?:audit(?: \d{1,3})?|ledger(?: \d{1,3})?|arbitrage(?: \d{1,3})?|calibrate|'
+    r'simulate [a-z0-9_.-]+:[a-z0-9_./-]+ \d{1,7}(?: [A-Za-z0-9_]{1,16})?)',
+    r'mio_icif bounty (?:list|tables|errors|settings)', r'mio_icif reactor audit(?: \d{1,9})?',
     r'time query (?:day|daytime|gametime)', r'(?:neo)?forge tps(?: \S+)?', r'tps',
     r'spark (?:health|tps)(?: --[a-z-]+)*', r'data get (?:entity|block|storage) [^;]{1,200}',
     r'locate (?:structure|biome|poi) [a-z0-9_:#/.-]+',
@@ -87,6 +93,8 @@ _READ_COMMANDS = tuple(re.compile(pattern + r'$', re.I) for pattern in (
     # Round 14: tick percentiles, the entity limiter's status, timing results (not `track start`).
     r'tick query', r'chesirtab status', r'neoforge track (?:blockentity|entity)',
 ))
+# `jfr start` / `jfr stop` stay 'confirm' (each run leaves ~15 MB in debug/): the bounded, admin-only
+# sample with its cooldown and guaranteed stop is server_traffic topic=packets (round 26).
 _LOW_COMMANDS = tuple(re.compile(pattern + r'$', re.I) for pattern in (
     r'weather (?:clear|rain|thunder)(?: \d{1,6})?',
     r'time (?:set (?:day|night|noon|midnight|\d{1,7})|add \d{1,7})',

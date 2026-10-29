@@ -278,7 +278,7 @@ class AdvancementTests(unittest.TestCase):
         self.assertIn('进度完成排行（共 4 个进度，2 名玩家有记录）：\n1. Alice：3 个（75%）\n2. Bob：1 个（25%）', ranking)
         alice = self.report(player='alice')
         self.assertIn('- 已完成 3/4 个（75%）', alice)
-        self.assertIn('- 按模组（完成最多的）：Botania 2/2、Minecraft 1/2', alice)
+        self.assertIn('- 按模组（完成最多的）：Botania 2/2（100%）、Minecraft 1/2（50%）', alice)
         self.assertIn('- 其中挑战类 1/1 个', alice)
         self.assertIn('- 最近完成：「盖亚守护者」（Botania，10-22 10:00）、「花之 初」（Botania，10-21 10:00）', alice)
         self.assertIn('- 少有人完成的：「盖亚守护者」（全服 1 人）', alice)
@@ -456,12 +456,13 @@ class WiringTests(unittest.TestCase):
         for tool in (s.ADVANCEMENT_PROGRESS, s.SERVER_MARKET, s.THAUMCRAFT_WORLD):
             self.assertIn(tool, s.TOOLS_MEMBER)
             self.assertIn(tool, s.TOOLS_ADMIN)
-        self.assertIn(s.MACHINE_PROFILE, s.TOOLS_ADMIN)
-        self.assertNotIn(s.MACHINE_PROFILE, s.TOOLS_MEMBER)
-        self.assertNotIn(s.MACHINE_PROFILE, s.SERVER_INFO_TOOLS)
+        for tool in (s.MACHINE_PROFILE, s.PLAYER_TRAIL):
+            self.assertIn(tool, s.TOOLS_ADMIN)
+            self.assertNotIn(tool, s.TOOLS_MEMBER)
+            self.assertNotIn(tool, s.SERVER_INFO_TOOLS)
         self.assertIn('logins', s.PLAYER_STATS['function']['parameters']['properties']['top']['enum'])
         source = Path(s.__file__).read_text(encoding='utf-8')
-        self.assertIn('+ ([MACHINE_PROFILE] if privileged else []))', source)
+        self.assertIn('+ ([MACHINE_PROFILE, PLAYER_TRAIL] if privileged else []))', source)
         self.assertIn('“上次登录”（服务器面板记录）', source)
 
     def test_read_commands(self):

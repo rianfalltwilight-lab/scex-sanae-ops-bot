@@ -143,10 +143,15 @@ class LegacyMacOpsTests(unittest.TestCase):
 
     def test_control_worker_uses_exit_status_and_only_mock_notification(self):
         for returncode in (0, 1):
-            with mock.patch.object(control.subprocess, 'run', return_value=types.SimpleNamespace(returncode=returncode)) as run, \
+            process = mock.Mock()
+            process.wait.return_value = returncode
+            with mock.patch.object(control.subprocess, 'Popen', return_value=process) as popen, \
+                    mock.patch.object(control, 'server_state', return_value='fixture server status') as state, \
                     mock.patch.object(control, 'notify') as notify:
                 control.run('restart', '123')
-            self.assertEqual(control.control_args('restart', '123'), run.call_args.args[0])
+            self.assertEqual(control.control_args('restart', '123'), popen.call_args.args[0])
+            process.wait.assert_called_once_with(timeout=control.RUN_TIMEOUT_SECONDS)
+            self.assertEqual(bool(returncode), state.called)
             self.assertIn('正在加载' if returncode == 0 else '失败', notify.call_args.args[0])
 
 

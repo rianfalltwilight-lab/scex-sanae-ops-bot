@@ -110,7 +110,7 @@ class AccountIdentityTests(unittest.TestCase):
         return bridge, ai
 
     def test_identity_current_default_and_configured_accounts(self):
-        for configured in (None, PREVIOUS_QQ, NEW_QQ, OTHER_QQ):
+        for configured in (None, OLD_QQ, PREVIOUS_QQ, NEW_QQ, OTHER_QQ):
             with self.subTest(configured=configured), mock.patch.dict(os.environ), mock.patch.dict(sys.modules):
                 sys.modules.pop("sanae_identity", None)
                 if configured is None:

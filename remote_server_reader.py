@@ -201,7 +201,7 @@ print(json.dumps({'dims': dims, 'errors': errors, 'saved_at': newest}))
 # The port keeps these in the player's persistent data ("NeoForgeData"), mirrored by
 # the thaumcraft:player_progress_data attachment.
 _RESEARCH_SCRIPT = r"""
-import base64, gzip, io, json, os, struct, time
+import base64, gzip, io, json, os, re, struct, time
 cfg = json.loads(base64.b64decode('__CONFIG__'))
 root = cfg['root']
 KEEP = {'NeoForgeData', 'neoforge:attachments', 'thaumcraft:player_progress_data', 'ThaumcraftResearch',
@@ -253,8 +253,11 @@ except Exception:
     pass
 players, errors = {}, 0
 folder = os.path.join(root, 'world', 'playerdata')
+UUID_DAT = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.dat', re.I)
 for name in os.listdir(folder):
-    if not name.endswith('.dat'):
+    # A save interrupted on 10-14 left "<uuid>-14321109007495561602.dat", a truncated temp copy
+    # the game never reads; it was reported as an unreadable player file every 30 minutes.
+    if not UUID_DAT.fullmatch(name):
         continue
     try:
         with open(os.path.join(folder, name), 'rb') as stream:

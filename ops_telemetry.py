@@ -25,7 +25,7 @@ from backup_verify import format_backup_verification, verify_latest_backups
 from mod_inventory import format_inventory, jar_signature, scan_installed_mods
 from ops_contract import append_jsonl, normalize_log_fingerprint
 from runtime_paths import default_path
-from recipe_index import (atomic_write_json as write_recipe_json, build_recipe_index,
+from recipe_index import (INDEX_SCHEMA, atomic_write_json as write_recipe_json, build_recipe_index,
                           format_recipe, query_recipes, recipe_signature, render_recipe_png)
 
 
@@ -289,7 +289,8 @@ class OpsTelemetry:
         if force or current_mods.get("schema") != 2 or current_mods.get("signature") != mod_sig:
             write_json(mods_path, scan_installed_mods(self.server_dir, self.server_id, self.prefix))
             changed.append("mods")
-        if force or current_recipes.get("signature") != recipe_sig:
+        if (force or current_recipes.get("signature") != recipe_sig
+                or current_recipes.get("schema") != INDEX_SCHEMA):
             write_recipe_json(recipe_path, build_recipe_index(
                 self.server_dir, self.server_id, self.prefix))
             changed.append("recipes")

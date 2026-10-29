@@ -22,6 +22,7 @@ from server_registry import parse_player_list, query_server, resolve_server, ser
 from advancement_localization import AdvancementLocalizer
 from remote_log_reader import read_remote_lines, source_id
 from remote_crash_reader import read_remote_crashes, render as render_crash
+import backup_status
 import remote_mods_mirror
 import remote_server_reader
 import command_catalog
@@ -72,6 +73,14 @@ LAG_ALERT_GROUPS = _groups('LEGACY_LAG_ALERT_GROUPS')
 LAG_ALERT_TPS = float(os.environ.get('LEGACY_LAG_ALERT_TPS', '10'))
 LAG_ALERT_MINUTES = 5
 LAG_ALERT_REPEAT = 3600
+# Moderate lag that lasts: average TPS of the last 20 minutes (0 = off).
+LAG_SUSTAINED_TPS = float(os.environ.get('LEGACY_LAG_SUSTAINED_TPS', '14'))
+LAG_SUSTAINED_MINUTES = max(5, int(os.environ.get('LEGACY_LAG_SUSTAINED_MINUTES', '20')))
+# World backups (backup_status): an alert when none has worked for this long and the scheduled run fails.
+BACKUP_ALERT_GROUPS = _groups('LEGACY_BACKUP_ALERT_GROUPS') or LAG_ALERT_GROUPS
+BACKUP_STALE_HOURS = float(os.environ.get('LEGACY_BACKUP_STALE_HOURS', '6'))
+BACKUP_ALERT_REPEAT = 12 * 3600
+BACKUP_CHECK_SECONDS = 300
 # Mod changes found by the mirror; empty = record only.
 UPDATE_NOTIFY_GROUPS = _groups('LEGACY_UPDATE_NOTIFY_GROUPS')
 # The bridge sets this to a one-line AI summary of a change list; None = list only.
@@ -316,7 +325,8 @@ def _flush_notices(push_fn):
     """One message per queued notice; lag alerts expire after 30 minutes, updates after 6 hours."""
     with _NOTICE_LOCK:
         for name, groups, max_age in (('legacy-lag-notify', LAG_ALERT_GROUPS, 1800),
-                                      ('legacy-update-notify', UPDATE_NOTIFY_GROUPS, 6 * 3600)):
+                                      ('legacy-update-notify', UPDATE_NOTIFY_GROUPS, 6 * 3600),
+                                      ('legacy-backup-notify', BACKUP_ALERT_GROUPS, BACKUP_ALERT_REPEAT)):
             for group in groups:
                 state_name = f'{name}-{group}'
                 if (load_state(state_name, {'items': []}) or {}).get('items'):
@@ -330,14 +340,22 @@ def _lag_watch(row):
     state = load_state('legacy-lag-watch', {}) or {}
     state, streak = server_watch.lag_step(state, row, threshold=LAG_ALERT_TPS,
                                           minutes=LAG_ALERT_MINUTES, repeat=LAG_ALERT_REPEAT)
+    sustained = None
+    if LAG_SUSTAINED_TPS > 0:
+        state['sustained'], sustained = server_watch.sustained_step(
+            state.get('sustained'), row, threshold=LAG_SUSTAINED_TPS, minutes=LAG_SUSTAINED_MINUTES,
+            repeat=LAG_ALERT_REPEAT)
     text = None
+    quiet = time.time() - float(state.get('last_alert_at') or 0) < LAG_ALERT_REPEAT
     # A fresh streak within an hour of the last alert stays quiet; a long one repeats hourly.
-    if streak and (streak['continuing']
-                   or time.time() - float(state.get('last_alert_at') or 0) >= LAG_ALERT_REPEAT):
+    if not (streak and (streak['continuing'] or not quiet)):
+        streak = sustained if sustained and not quiet else None
+    if streak:
         details = {}
         for command in ('neoforge tps', 'list', 'neoforge entity list', 'mio_icif perf',
                         'neoforge entity list "minecraft:item"', 'neoforge entity list "minecraft:experience_orb"',
-                        'statistics block-entities byType', 'servercore status', 'tick query'):
+                        'statistics block-entities byType', 'servercore status', 'tick query',
+                        'statistics entities byPlayer', 'statistics block-entities byPlayer'):
             try:
                 details[command] = query_server(SERVER, command)
             except Exception:
@@ -350,14 +368,47 @@ def _lag_watch(row):
                                              details['neoforge entity list "minecraft:item"'],
                                              details['neoforge entity list "minecraft:experience_orb"'],
                                              details['statistics block-entities byType'],
-                                             details['servercore status'], host, details['tick query'])
+                                             details['servercore status'], host, details['tick query'],
+                                             details['statistics entities byPlayer'],
+                                             details['statistics block-entities byPlayer'])
         text = server_watch.format_lag_alert(PREFIX, streak, details['neoforge tps'], details['list'], extra)
         state['last_alert_at'] = time.time()
-        OPS.record_event('lag_alert', text, min_tps=streak['min_tps'], since=streak['start'])
+        OPS.record_event('lag_alert', text, min_tps=streak['min_tps'], since=streak['start'],
+                         kind=streak.get('kind') or 'streak')
         print(f'{PREFIX} [卡顿提醒] 最低 TPS {streak["min_tps"]:.1f}，已排队发送', flush=True)
     save_state('legacy-lag-watch', state)
     if text:
         _queue_notice('legacy-lag-notify', LAG_ALERT_GROUPS, text)
+    return text
+
+
+def _backup_watch(now=None, reader=None):
+    """Tell the admins when the world has gone BACKUP_STALE_HOURS without a backup while the
+    scheduled run keeps failing; again every 12 hours, and once when it works again.
+    The external backup task does not have to send QQ notifications itself."""
+    if not BACKUP_ALERT_GROUPS or BACKUP_STALE_HOURS <= 0:
+        return None
+    now = time.time() if now is None else now
+    state = load_state('legacy-backup-watch', {}) or {}
+    if now - float(state.get('checked_at') or 0) < BACKUP_CHECK_SECONDS:
+        return None
+    state['checked_at'] = now
+    data = (reader or backup_status.read)(now=now)
+    text = None
+    if data.get('available') and data.get('enabled'):
+        hours = backup_status.stale_hours(data)
+        if hours is not None and hours >= BACKUP_STALE_HOURS and backup_status.failing(data):
+            if now - float(state.get('alerted_at') or 0) >= BACKUP_ALERT_REPEAT:
+                text = backup_status.format_alert(PREFIX, data)
+                state.update(alerted_at=now, alerted_success=data.get('last_success'))
+        elif state.get('alerted_at') and float(data.get('last_success') or 0) > float(state.get('alerted_success') or 0):
+            text = backup_status.format_recovered(PREFIX, data)
+            state.update(alerted_at=None, alerted_success=None)
+    save_state('legacy-backup-watch', state)
+    if text:
+        _queue_notice('legacy-backup-notify', BACKUP_ALERT_GROUPS, text)
+        OPS.record_event('backup_alert', text)
+        print(f'{PREFIX} [备份提醒] 已排队发送', flush=True)
     return text
 
 
@@ -724,6 +775,7 @@ def scan_once(push_fn=push_group):
         LLBOT_MANAGEMENT_GROUP, 10, push_fn)
     if push_fn is push_group and REMOTE:
         _lag_watch(_sample_remote_runtime())
+        _backup_watch()
         refresh_mirror()
         _flush_notices(push_fn)
         _publish_weekly(push_fn)
@@ -753,6 +805,7 @@ def collect_once(push_fn=push_group):
         crashes = remote_crashwatch()
         if CRASH_NOTIFY_GROUPS:
             _notify_crashes(crashes, push_fn)
+        _backup_watch()
         refresh_mirror()
         _flush_notices(push_fn)
     else:

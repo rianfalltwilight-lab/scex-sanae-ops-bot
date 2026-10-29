@@ -39,6 +39,8 @@ $env:GOOGLE_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com'
 $env:GEMINI_MODEL = 'YOUR_GEMINI_MODEL'
 $env:GEMINI_THINKING_LEVEL = 'high'
 $env:GEMINI_STREAM = '1'
+$env:GEMINI_RETRIES = '2' # 瞬时服务错误的额外重试，仍受整轮超时限制
+$env:SANAE_INTERIM_DELAY = '20' # 较慢请求才发中间等待提示（秒）
 # Optional cross-provider fallback; requires a separately configured DeepSeek key.
 # $env:SANAE_TEXT_FALLBACK = 'deepseek'
 # GEMINI_API_KEY 不要写入此文件；生产环境请存入私有 secrets.json 的 gemini_api_key。
@@ -62,6 +64,12 @@ $env:RELAY_G2S = '0' # 状态/TPS 查询仍可用；按需显式开启聊天转�
 # $env:SANAE_LEGACY_BACKUP_PIPELINE = '<backup pipeline script>'
 # $env:SANAE_MSLX_CONTROL_SCRIPT = '<MSLX control script>'
 # $env:SANAE_SHOP_MONITOR_ROOT = '<shop monitor data directory>'
+# $env:LEGACY_BACKUP_TOOL_DIR = '<backup tool state directory>'
+
+# Player names/coordinates remain private local state; collection is opt-in.
+$env:PLAYER_TRAIL_ENABLED = '0'
+# $env:PLAYER_TRAIL_SERVER = 'legacy' # 必须是已配置的服务器 ID
+# $env:PLAYER_BINDINGS_SERVER = 'legacy'
 
 # Private archives: successful bot replies and incoming messages remain local.
 # $env:SOCIAL_REPLY_ARCHIVE = Join-Path $PSScriptRoot 'logs/reply-archive'

@@ -11,7 +11,14 @@ import server_insight
 import player_progress
 import remote_server_reader
 import world_records
+import market_audit
+import server_network
+import server_traffic
 import world_status
+import backup_status
+import lookup_tools
+import mod_lookup
+import player_trail
 from mod_inventory import scan_installed_mods, format_inventory
 from ops_telemetry import OpsTelemetry
 from runtime_paths import default_path
@@ -24,12 +31,15 @@ DISABLED_FILE_TOOLS = frozenset({'list_dir', 'read_file', 'search_files', 'read_
 INSIGHT_TOOLS = frozenset({'server_trends', 'server_events', 'player_stats', 'quest_lookup',
                            'search_server_config', 'read_server_config', 'server_world',
                            'quest_progress', 'thaumcraft_progress', 'advancement_progress',
-                           'server_market', 'thaumcraft_world', 'machine_profile'})
+                           'server_market', 'thaumcraft_world', 'machine_profile', 'market_audit',
+                           'server_network', 'server_traffic', 'recipe_lookup', 'mod_info', 'player_trail'})
+# The bridge sets this to its MC 百科 search: keyword -> (title, intro, link) or None (round 30).
+WIKI_FETCH = None
 ENTITY_ALIASES = {'掉落物': 'minecraft:item', '物品': 'minecraft:item', 'item': 'minecraft:item',
                   '经验球': 'minecraft:experience_orb', '经验': 'minecraft:experience_orb',
                   'experience_orb': 'minecraft:experience_orb', 'xp': 'minecraft:experience_orb'}
 ADMIN_INSIGHT_TOOLS = frozenset({'search_server_config', 'read_server_config'})
-WORLD_TOPICS = ('chunks', 'entities', 'lag', 'machines', 'host')
+WORLD_TOPICS = ('chunks', 'entities', 'lag', 'machines', 'host', 'players')
 HOST_CACHE_SECONDS = 30
 _HOST_CACHE = {}
 # Admin-started NeoForge timing samples: one at a time, a fresh one at most every 5 minutes.
@@ -89,6 +99,11 @@ def execute_insight(name, args, selected, privileged):
     server = _resolved_server(selected)
     ops_root = Path(os.environ.get('OPS_STATE_BASE') or default_path('state', 'ops')) / server['id']
     mirror = server.get('server_dir') or ''
+    try:
+        # A JFR traffic sample that a bot restart left running is stopped on the next query.
+        server_traffic.recover(ops_root, lambda command: server_registry.query_server(server, command))
+    except Exception:
+        pass
     prefix = server['prefix'] + ' '
     if name == 'server_trends':
         return prefix + server_insight.trends(ops_root, args.get('window') or '24h')
@@ -104,7 +119,8 @@ def execute_insight(name, args, selected, privileged):
                                               limit=args.get('limit') or 30, online=online)
     if name == 'player_stats':
         return prefix + server_insight.player_stats(ops_root, player=args.get('player') or '',
-                                                    top=args.get('top') or '')
+                                                    top=args.get('top') or '', limit=args.get('limit') or 10,
+                                                    order=args.get('order') or 'desc')
     if name == 'quest_lookup':
         return prefix + server_insight.quest_lookup(mirror, ops_root, args.get('query') or '')
     if name == 'server_world':
@@ -116,7 +132,21 @@ def execute_insight(name, args, selected, privileged):
                                                           mirror_root=mirror or None)
     if name == 'advancement_progress':
         return prefix + player_progress.advancement_progress(mirror, ops_root, args.get('player') or '',
-                                                             args.get('query') or '')
+                                                             args.get('query') or '', limit=args.get('limit'),
+                                                             order=args.get('order') or 'recent')
+    if name == 'server_network':
+        try:
+            online = len((server_registry.parse_player_list(server_registry.query_server(server, 'list')) or {})
+                         .get('players') or [])
+        except Exception:
+            online = None
+        return server_network.report(server, server['prefix'], privileged, online=online)
+    if name == 'server_traffic':
+        return _traffic(server, args, ops_root, privileged)
+    if name == 'market_audit':
+        # Live, over RCON: the SI exchange's own read-only audit subcommands (0.1.10.29+).
+        return market_audit.report(lambda command: server_registry.query_server(server, command),
+                                   server['prefix'], args, privileged, world_records.item_names(ops_root))
     if name in ('server_market', 'thaumcraft_world'):
         if not server.get('remote_ssh_host'):
             return prefix + '这台服务器不在远端主机上，暂时查不了存档数据。'
@@ -137,6 +167,25 @@ def execute_insight(name, args, selected, privileged):
         if not privileged:
             return '拒绝：机器耗时采样只有管理员能开。'
         return _profile(server, args, ops_root)
+    if name == 'player_trail':
+        # PvP is on: where someone has been is for admins only (owner decision 10-27).
+        if not privileged:
+            return '拒绝：玩家轨迹只有管理员能查。'
+        return player_trail.report(server['prefix'], ops_root / player_trail.FILE_NAME, args.get('player') or '',
+                                   args.get('minutes'), args.get('min_jump'), args.get('near') or '',
+                                   args.get('radius'))
+    if name == 'recipe_lookup':
+        mode = str(args.get('mode') or 'make')
+        if mode not in ('make', 'uses', 'machine'):
+            raise ValueError('mode 只能是 make、uses 或 machine')
+        return prefix + lookup_tools.recipe_lookup(
+            ops_root / 'recipe-index.json', args.get('query') or '', mode,
+            Path(mirror) / 'kubejs' / 'server_scripts' if mirror else None, names=world_records.item_names(ops_root))
+    if name == 'mod_info':
+        return prefix + lookup_tools.mod_info(
+            args.get('name') or '', lookup_tools.load_index(ops_root / 'mod-inventory.json'),
+            modrinth=mod_lookup.search_modrinth, versions=lookup_tools.modrinth_versions,
+            curseforge=mod_lookup.search_cf_api if mod_lookup.CF_API_KEY else None, wiki=WIKI_FETCH)
     if not mirror:
         return prefix + '这台服务器没有本机同步的配置副本。'
     if name == 'search_server_config':
@@ -179,21 +228,58 @@ def _world(server, args, ops_root, mirror, privileged):
             host = None           # the RCON numbers still answer the question
         return world_status.format_lag(prefix, query('neoforge tps'), query('mio_icif perf'),
                                        query('neoforge entity list'), query('statistics block-entities byType'),
-                                       query('servercore status'), host, server_insight.item_names(ops_root),
+                                       query('servercore status'), host, world_records.item_names(ops_root),
                                        tick_text=optional('tick query'))
+    if topic == 'backup':
+        if server.get('id') != 'legacy':
+            return prefix + ' 这台服务器的备份不在我这里记录。'
+        # Members see when it last worked and whether it is failing; admins the reason and the disk.
+        return backup_status.format_status(prefix, backup_status.read(), detailed=privileged)
     if topic == 'machines':
+        block = str(args.get('block') or '').strip().strip('"')[:60]
+        if block:
+            return world_status.format_block_count(prefix, block, world_status.scan_statistics(query),
+                                                   world_records.item_names(ops_root))
         return world_status.format_machines(prefix, query('statistics block-entities byType'),
                                             query('statistics block-entities byType 2'),
                                             query('statistics block-entities byPlayer'),
-                                            query('statistics entities byPlayer'), server_insight.item_names(ops_root))
+                                            query('statistics entities byPlayer'), world_records.item_names(ops_root))
+    if topic == 'players':
+        # Player positions in a public group help raiders (PvP is on): only when an admin asks.
+        return world_status.format_players(prefix, world_status.player_locations(query, query('list')),
+                                           detailed=bool(privileged and args.get('with_coordinates')))
     if topic == 'host':
         if not server.get('remote_ssh_host'):
             return prefix + ' 这台服务器不在远端主机上，暂时查不了进程内存和 CPU。'
         try:
-            return world_status.format_host(prefix, _host(server))
+            text = world_status.format_host(prefix, _host(server))
         except Exception as exc:
             return prefix + f' 服务器主机暂时连不上（{type(exc).__name__}），稍后再查。'
+        # 10-28 17:52, the main thread hung: from "运行了 3 小时 7 分钟" she told the group the server was fine.
+        try:
+            query('list')
+            return text + '\n- 游戏控制台（RCON）：响应正常'
+        except Exception as exc:
+            return text + (f'\n- 游戏控制台（RCON）：没有响应（{type(exc).__name__}）。进程还在、运行时间很长都不代表服务器正常：'
+                           '主线程多半卡死了，玩家多半已经掉线。这时不能说服务器好好开着。')
     raise ValueError('topic 只能是 ' + '、'.join(WORLD_TOPICS))
+
+
+def _traffic(server, args, ops_root, privileged):
+    """Per-player traffic (everyone; names for admins) or a JFR packet sample (admins start one)."""
+    topic = str(args.get('topic') or 'players')
+    if topic not in ('players', 'packets'):
+        raise ValueError('topic 只能是 players 或 packets')
+    if not server.get('remote_ssh_host'):
+        return server['prefix'] + ' 这台服务器不在远端主机上，测不了流量。'
+
+    def query(command):
+        return server_registry.query_server(server, command)
+    if topic == 'players':
+        return server_traffic.players_report(server, query, ops_root, privileged)
+    if not privileged:
+        return server_traffic.last_packets_report(server, ops_root)
+    return server_traffic.packets_report(server, query, ops_root, args.get('seconds'))
 
 
 def _profile(server, args, ops_root):

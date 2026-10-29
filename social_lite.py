@@ -468,6 +468,12 @@ class SocialLite:
         reply = event.get("reply")
         if isinstance(reply, dict) and str(reply.get("user_id") or "") == self.self_id:
             score += 4; reasons.append("reply")
+        if not reasons:
+            # 10-28 14:17 "@Alice 上次要加啥mod来着？" was a question to Alice; she answered it herself.
+            others = [qq for qq in re.findall(r"\[CQ:at,qq=(\d+)", raw)
+                      if qq != self.self_id and qq not in HISTORICAL_BOT_QQ]
+            if others:
+                return 0, "addressed-elsewhere"
         if self._is_closing_text(raw):
             # Let a person end their own recent exchange without having to @
             # again; a farewell elsewhere in a busy group is not a summons.
